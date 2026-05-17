@@ -64,9 +64,17 @@ INSTAGRAM_USER_ID      = _optional("INSTAGRAM_USER_ID")
 AMAZON_AFFILIATE_TAG   = _optional("AMAZON_AFFILIATE_TAG")
 
 # ── Engine timing ──────────────────────────────────────────────────────────────
-SPORTS_LOOP_SECONDS  = 60
+SPORTS_LOOP_SECONDS  = 120   # base interval — 2 min = ~720 calls/day max
 TRADING_LOOP_SECONDS = 30
 CONTENT_LOOP_HOURS   = 3
+
+# ── API budget control ─────────────────────────────────────────────────────────
+# 20,000 requests/month ÷ 30 days = 666/day ÷ 24h = ~27/hour = 1 per ~133s
+# Base loop of 120s stays comfortably under budget even with throttle reduction.
+# Dynamic throttle: after IDLE_CYCLES_THRESHOLD empty cycles, multiply sleep by
+# IDLE_BACKOFF_MULTIPLIER. Resets to base immediately when opportunities found.
+IDLE_CYCLES_THRESHOLD  = 3    # empty cycles before slowing down
+IDLE_BACKOFF_MULTIPLIER = 2   # 120s → 240s when idle (1 call per 4 min)
 
 # ── Sports thresholds ──────────────────────────────────────────────────────────
 SPORTS_EV_MIN_EDGE = 3.0
@@ -86,11 +94,16 @@ TRADING_WATCHLIST = [
 ]
 
 SPORTS_KEYS = [
+    # US major leagues — highest liquidity, most soft-book inefficiency
     "americanfootball_nfl",
     "basketball_nba",
     "baseball_mlb",
     "icehockey_nhl",
+    # College — large market, frequent soft-line delays
     "basketball_ncaab",
+    # Top soccer leagues — active year-round
+    "soccer_epl",
+    "soccer_usa_mls",
 ]
 
 SOFT_BOOKS  = ["draftkings", "fanduel", "betmgm", "caesars"]
