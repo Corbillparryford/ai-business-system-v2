@@ -295,18 +295,14 @@ def run_odds_monitor():
                         seen[key] = opp
                 deduped = list(seen.values())
 
-                # Hard cap at 10 — ensures Claude output stays small and parseable.
-                # call_betting_brain also sorts and caps at 20 internally; this
-                # cap comes first and is the stronger constraint.
-                limited = sorted(
+                # Limit opportunities to prevent Claude overload
+                limited_opps = sorted(
                     deduped,
                     key=lambda o: float(o.get("edge", o.get("arb_percentage", 0))),
                     reverse=True,
-                )[:10]
-
-                log.info("Opportunities raw: %d → deduped: %d → capped: %d → sending to Claude",
-                         len(opportunities), len(deduped), len(limited))
-                result = call_betting_brain(limited, data_quality)
+                )[:8]
+                log.info("Sending %d opportunities to Claude", len(limited_opps))
+                result = call_betting_brain(limited_opps, data_quality)
 
                 for signal in result.get("signals", []):
                     check = validate_signal(signal)
