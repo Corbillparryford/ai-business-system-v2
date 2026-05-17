@@ -10,14 +10,15 @@ Every prompt enforces strict JSON-only output.
 _JSON_RULES = (
     "You MUST return ONLY valid JSON with this exact structure: {{\"signals\": []}}\n"
     "Rules:\n"
-    "- ONLY JSON (no text before or after)\n"
-    "- Use double quotes ONLY\n"
-    "- No trailing commas\n"
-    "- Max 5 signals\n"
-    "- Keep reasoning under 2 sentences\n"
-    "- Start response with {{ and end with }}\n"
+    "- Return a MAXIMUM of 4 signals\n"
+    "- Return at least 1 signal if valid opportunities exist\n"
+    "- JSON ONLY (no text before or after)\n"
+    "- Double quotes only\n"
     "- No markdown\n"
-    "- No comments"
+    "- No extra text\n"
+    "- No trailing commas\n"
+    "- Reasoning must be 1-2 sentences MAX\n"
+    "- Start response with {{ and end with }}"
 )
 
 
