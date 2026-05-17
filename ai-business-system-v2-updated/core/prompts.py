@@ -8,19 +8,16 @@ Every prompt enforces strict JSON-only output.
 # Strict JSON enforcement block injected at the top of every prompt.
 # Braces that must appear literally in prompt text are doubled ({{ }}).
 _JSON_RULES = (
-    "STRICT OUTPUT RULES:\n"
-    "- Your response MUST start with {{ and end with }}\n"
-    "- Output MUST be valid JSON only\n"
-    "- NO markdown, NO code fences, NO backticks\n"
-    "- NO explanations, NO comments, NO extra text\n"
-    "- ALL keys MUST use double quotes\n"
-    "- ALL string values MUST use double quotes\n"
-    "- Numbers MUST NOT be quoted\n"
-    "- NO trailing commas anywhere\n"
-    "- NO single quotes\n"
-    "- Keep reasoning SHORT: 1-2 sentences, no special characters\n"
-    "- Return a MAXIMUM of 5 signals\n"
-    "- Anything outside the JSON object causes a system failure"
+    "You MUST return ONLY valid JSON with this exact structure: {{\"signals\": []}}\n"
+    "Rules:\n"
+    "- ONLY JSON (no text before or after)\n"
+    "- Use double quotes ONLY\n"
+    "- No trailing commas\n"
+    "- Max 5 signals\n"
+    "- Keep reasoning under 2 sentences\n"
+    "- Start response with {{ and end with }}\n"
+    "- No markdown\n"
+    "- No comments"
 )
 
 
