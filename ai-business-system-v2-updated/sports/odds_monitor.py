@@ -38,6 +38,7 @@ from discord.poster import post_signal, post_health_alert
 from sports.betting_math import (
     implied_prob, remove_vig, ev_edge_pct, calc_arbitrage, best_per_side,
 )
+from sports.results_tracker import resolve_completed_sports_signals
 from sports.data_clients import (
     fetch_sportsbook_odds, fetch_polymarket_sports,
     fetch_kalshi_sports, minutes_until,
@@ -205,46 +206,6 @@ def _scan_polymarket(poly: list, sb_games: list) -> list:
     return opps
 
 
-# ── Result resolution ─────────────────────────────────────────────────────────
-
-def _check_results():
-    """
-    For active sports signals where the game has now started (timing expired),
-    we can't automatically know the result without a scores API.
-    This function marks them EXPIRED after 4 hours so they don't clog the DB.
-    In production, integrate a scores API (e.g. The Odds API scores endpoint)
-    to auto-resolve WIN/LOSS.
-    """
-    active = get_active_sports_signals()
-    expired = []
-    for sig in active:
-        created = datetime.fromisoformat(sig["created_at"])
-        age_hrs = (datetime.utcnow() - created).total_seconds() / 3600
-        if age_hrs > 4:
-            expired.append(sig)
-
-    if expired:
-        summaries = []
-        for sig in expired:
-            resolve_sports_signal(sig["id"], "VOID", "Auto-expired after 4h")
-            summaries.append({
-                "signal_id":    sig["id"],
-                "matchup":      sig["matchup"],
-                "play":         sig["play"],
-                "odds":         sig["odds"],
-                "result":       "VOID",
-                "note":         "Expired — scores API not integrated",
-                "result_kind":  "sports",
-            })
-
-        # Generate result summaries via Claude
-        if summaries:
-            result_data = call_result_summary(summaries, "sports")
-            for r in result_data.get("results", []):
-                r["result_kind"] = "sports"
-                post_signal(r, "result")
-
-
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def run_odds_monitor():
@@ -281,21 +242,8 @@ def run_odds_monitor():
             opportunities.extend(_scan_polymarket(poly_mkts, sb_games))
 
             if opportunities:
-                # Reset idle counter — active market, use base interval
                 idle_cycles = 0
-
-                # Deduplicate: keep highest-edge entry per matchup+book+play combo.
-                # Collapses 100+ raw opportunities down to unique actionable entries.
-                seen: dict[str, dict] = {}
-                for opp in opportunities:
-                    key = f"{opp.get('type')}|{opp.get('matchup')}|{opp.get('book')}|{opp.get('play')}"
-                    existing = float(seen[key].get("edge", seen[key].get("arb_percentage", 0))) if key in seen else -1
-                    this     = float(opp.get("edge", opp.get("arb_percentage", 0)))
-                    if this > existing:
-                        seen[key] = opp
-                deduped = list(seen.values())
-
-                # Limit and prioritize best opportunities before sending to Claude
+                # ✅ SORT AND LIMIT INPUT
                 limited_opps = sorted(
                     opportunities,
                     key=lambda o: float(o.get("edge", o.get("arb_percentage", 0))),
@@ -316,8 +264,8 @@ def run_odds_monitor():
                 idle_cycles += 1
                 log.debug("No opportunities this cycle (idle streak: %d)", idle_cycles)
 
-            # Check for results / expirations
-            _check_results()
+            # Resolve completed game results via real scores API
+            resolve_completed_sports_signals()
 
         except Exception as e:
             log.error("odds_monitor error: %s", e)
