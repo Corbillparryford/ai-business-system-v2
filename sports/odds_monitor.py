@@ -1,16 +1,22 @@
 """
 sports/odds_monitor.py
 ======================
-Sports betting engine — runs every 60 seconds.
+Sports betting engine — runs every 120 seconds (base interval).
 
 Per cycle:
   1. Fetch odds (OddsAPI + Polymarket + Kalshi)
-  2. Filter to 5–25 min game window
-  3. Skip if odds unchanged (fingerprint cache)
-  4. Run EV and arb math
-  5. Claude validates + enriches
-  6. Post to #ev-signals / #arb-signals + #free-signals teaser
-  7. Check previously posted signals for results (game started → resolve)
+  2. Skip unchanged games (fingerprint cache)
+  3. Run EV and arb math
+  4. Claude validates + enriches
+  5. Post to #ev-signals / #arb-signals + #free-signals teaser
+  6. Check previously posted signals for results (game started → resolve)
+
+API budget control:
+  - Base loop: 120s → ~720 OddsAPI calls/day max (well under 666/day budget)
+  - Dynamic throttle: after IDLE_CYCLES_THRESHOLD consecutive empty cycles,
+    sleep doubles to SPORTS_LOOP_SECONDS * IDLE_BACKOFF_MULTIPLIER.
+    Resets to base immediately when opportunities are found.
+  - Fingerprint cache skips processing of unchanged odds, reducing Claude calls.
 """
 
 import hashlib
@@ -22,7 +28,7 @@ from datetime import datetime
 from core.config import (
     SOFT_BOOKS, SHARP_BOOKS,
     SPORTS_EV_MIN_EDGE, SPORTS_ARB_MIN_PCT, SPORTS_GAME_WINDOW,
-    SPORTS_LOOP_SECONDS,
+    SPORTS_LOOP_SECONDS, IDLE_CYCLES_THRESHOLD, IDLE_BACKOFF_MULTIPLIER,
 )
 from core.claude_client import call_betting_brain, call_result_summary, validate_signal
 from core.db import (
@@ -242,7 +248,10 @@ def _check_results():
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def run_odds_monitor():
-    log.info("Odds monitor started")
+    log.info("Odds monitor started — base interval %ds", SPORTS_LOOP_SECONDS)
+
+    idle_cycles = 0   # consecutive cycles with zero opportunities found
+
     while True:
         loop_start    = time.time()
         opportunities = []
@@ -262,6 +271,7 @@ def run_odds_monitor():
 
                 books = {bm["key"]: bm for bm in game.get("bookmakers", [])} \
                     if "bookmakers" in game else game.get("books", {})
+                # Skip aggressively if odds are unchanged — no API value in reprocessing
                 if not _changed(game["game_id"], books):
                     continue
 
@@ -271,8 +281,28 @@ def run_odds_monitor():
             opportunities.extend(_scan_polymarket(poly_mkts, sb_games))
 
             if opportunities:
-                log.info("Raw opportunities: %d — sending to Claude", len(opportunities))
-                result = call_betting_brain(opportunities, data_quality)
+                # Reset idle counter — active market, use base interval
+                idle_cycles = 0
+
+                # Deduplicate: keep highest-edge entry per matchup+book+play combo.
+                # Collapses 100+ raw opportunities down to unique actionable entries.
+                seen: dict[str, dict] = {}
+                for opp in opportunities:
+                    key = f"{opp.get('type')}|{opp.get('matchup')}|{opp.get('book')}|{opp.get('play')}"
+                    existing = float(seen[key].get("edge", seen[key].get("arb_percentage", 0))) if key in seen else -1
+                    this     = float(opp.get("edge", opp.get("arb_percentage", 0)))
+                    if this > existing:
+                        seen[key] = opp
+                deduped = list(seen.values())
+
+                # Limit opportunities to prevent Claude overload
+                limited_opps = sorted(
+                    deduped,
+                    key=lambda o: float(o.get("edge", o.get("arb_percentage", 0))),
+                    reverse=True,
+                )[:8]
+                log.info("Sending %d opportunities to Claude", len(limited_opps))
+                result = call_betting_brain(limited_opps, data_quality)
 
                 for signal in result.get("signals", []):
                     check = validate_signal(signal)
@@ -283,7 +313,8 @@ def run_odds_monitor():
                     save_sports_signal(signal)
                     post_signal(signal, "sports")
             else:
-                log.debug("No opportunities this cycle")
+                idle_cycles += 1
+                log.debug("No opportunities this cycle (idle streak: %d)", idle_cycles)
 
             # Check for results / expirations
             _check_results()
@@ -295,6 +326,14 @@ def run_odds_monitor():
             except Exception:
                 pass
 
+        # ── Dynamic throttle ──────────────────────────────────────────────────
+        # If idle long enough, back off to conserve API budget.
+        # Snaps back to base interval the moment an opportunity is found.
+        if idle_cycles >= IDLE_CYCLES_THRESHOLD:
+            sleep_interval = SPORTS_LOOP_SECONDS * IDLE_BACKOFF_MULTIPLIER
+        else:
+            sleep_interval = SPORTS_LOOP_SECONDS
+
         elapsed   = time.time() - loop_start
-        sleep_for = max(0.0, SPORTS_LOOP_SECONDS - elapsed)
+        sleep_for = max(0.0, sleep_interval - elapsed)
         time.sleep(sleep_for)
