@@ -36,6 +36,34 @@ def _get_client() -> anthropic.Anthropic:
     return _client
 
 
+def _extract_json(raw: str) -> str:
+    """
+    Robustly extract the JSON object from Claude's response.
+    Handles: markdown fences, preamble text, trailing text, whitespace.
+    Returns the extracted string ready for json.loads().
+    """
+    text = raw.strip()
+
+    # Strip markdown code fences first
+    if "```" in text:
+        parts = text.split("```")
+        for part in parts:
+            part = part.strip()
+            if part.startswith("json"):
+                part = part[4:].strip()
+            if part.startswith("{"):
+                text = part
+                break
+
+    # Find the outermost JSON object: from first { to last }
+    start = text.find("{")
+    end   = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        text = text[start:end + 1]
+
+    return text.strip()
+
+
 def _call(prompt: str, max_tokens: int = 2000, temperature: float = 0.0) -> dict | None:
     client = _get_client()
     for attempt in range(1, MAX_RETRIES + 1):
@@ -46,21 +74,20 @@ def _call(prompt: str, max_tokens: int = 2000, temperature: float = 0.0) -> dict
                 temperature=temperature,
                 messages=[{"role": "user", "content": prompt}],
             )
-            raw = resp.content[0].text.strip()
-            # Strip accidental markdown fences
-            if raw.startswith("```"):
-                parts = raw.split("```")
-                raw = parts[1] if len(parts) > 1 else raw
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            return json.loads(raw.strip())
+            raw = resp.content[0].text
+            extracted = _extract_json(raw)
 
-        except json.JSONDecodeError as e:
-            log.warning("JSON parse error (attempt %d): %s", attempt, e)
+            try:
+                return json.loads(extracted)
+            except Exception:
+                log.error("Claude returned invalid JSON")
+                return None
+
         except anthropic.RateLimitError:
             wait = 10 * attempt
             log.warning("Rate limited — waiting %ds", wait)
             time.sleep(wait)
+            continue
         except anthropic.APIConnectionError as e:
             log.warning("Connection error (attempt %d): %s", attempt, e)
         except anthropic.APIError as e:
@@ -78,13 +105,22 @@ def _call(prompt: str, max_tokens: int = 2000, temperature: float = 0.0) -> dict
 # ── Public functions ──────────────────────────────────────────────────────────
 
 def call_betting_brain(opportunities: list, data_quality: str = "GOOD") -> dict:
+    # Pre-filter: keep only the top opportunities by edge to avoid truncation.
+    # Sort descending by edge, cap at 20 — enough for Claude to identify
+    # the best signals without blowing the token budget.
+    trimmed = sorted(
+        opportunities,
+        key=lambda o: float(o.get("edge", o.get("arb_percentage", 0))),
+        reverse=True,
+    )[:20]
+
     result = _call(
         BETTING_BRAIN_PROMPT.format(
             utc_timestamp=datetime.utcnow().isoformat(),
             data_quality=data_quality,
-            opportunities_json=json.dumps(opportunities, indent=2),
+            opportunities_json=json.dumps(trimmed, indent=2),
         ),
-        max_tokens=2000, temperature=0.0,
+        max_tokens=4000, temperature=0.0,
     )
     return result or {
         "signals": [], "rejected_count": 0,

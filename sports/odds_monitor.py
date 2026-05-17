@@ -295,12 +295,12 @@ def run_odds_monitor():
                         seen[key] = opp
                 deduped = list(seen.values())
 
-                # Limit opportunities to prevent Claude overload
+                # Limit and prioritize best opportunities before sending to Claude
                 limited_opps = sorted(
-                    deduped,
+                    opportunities,
                     key=lambda o: float(o.get("edge", o.get("arb_percentage", 0))),
                     reverse=True,
-                )[:8]
+                )[:10]
                 log.info("Sending %d opportunities to Claude", len(limited_opps))
                 result = call_betting_brain(limited_opps, data_quality)
 
