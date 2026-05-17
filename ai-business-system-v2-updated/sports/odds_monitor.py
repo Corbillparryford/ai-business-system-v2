@@ -283,8 +283,21 @@ def run_odds_monitor():
             if opportunities:
                 # Reset idle counter — active market, use base interval
                 idle_cycles = 0
-                log.info("Raw opportunities: %d — sending to Claude", len(opportunities))
-                result = call_betting_brain(opportunities, data_quality)
+
+                # Deduplicate: keep highest-edge entry per matchup+book+play combo.
+                # Collapses 100+ raw opportunities down to unique actionable entries.
+                seen: dict[str, dict] = {}
+                for opp in opportunities:
+                    key = f"{opp.get('type')}|{opp.get('matchup')}|{opp.get('book')}|{opp.get('play')}"
+                    existing = float(seen[key].get("edge", seen[key].get("arb_percentage", 0))) if key in seen else -1
+                    this     = float(opp.get("edge", opp.get("arb_percentage", 0)))
+                    if this > existing:
+                        seen[key] = opp
+                deduped = list(seen.values())
+
+                log.info("Opportunities raw: %d → deduped: %d → sending to Claude",
+                         len(opportunities), len(deduped))
+                result = call_betting_brain(deduped, data_quality)
 
                 for signal in result.get("signals", []):
                     check = validate_signal(signal)

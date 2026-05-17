@@ -78,13 +78,22 @@ def _call(prompt: str, max_tokens: int = 2000, temperature: float = 0.0) -> dict
 # ── Public functions ──────────────────────────────────────────────────────────
 
 def call_betting_brain(opportunities: list, data_quality: str = "GOOD") -> dict:
+    # Pre-filter: keep only the top opportunities by edge to avoid truncation.
+    # Sort descending by edge, cap at 20 — enough for Claude to identify
+    # the best signals without blowing the token budget.
+    trimmed = sorted(
+        opportunities,
+        key=lambda o: float(o.get("edge", o.get("arb_percentage", 0))),
+        reverse=True,
+    )[:20]
+
     result = _call(
         BETTING_BRAIN_PROMPT.format(
             utc_timestamp=datetime.utcnow().isoformat(),
             data_quality=data_quality,
-            opportunities_json=json.dumps(opportunities, indent=2),
+            opportunities_json=json.dumps(trimmed, indent=2),
         ),
-        max_tokens=2000, temperature=0.0,
+        max_tokens=4000, temperature=0.0,
     )
     return result or {
         "signals": [], "rejected_count": 0,
