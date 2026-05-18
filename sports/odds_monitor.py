@@ -23,21 +23,22 @@ import hashlib
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, date
 
 from core.config import (
     SOFT_BOOKS, SHARP_BOOKS,
     SPORTS_EV_MIN_EDGE, SPORTS_ARB_MIN_PCT, SPORTS_GAME_WINDOW,
     SPORTS_LOOP_SECONDS, IDLE_CYCLES_THRESHOLD, IDLE_BACKOFF_MULTIPLIER,
 )
-from core.claude_client import call_betting_brain, call_result_summary, validate_signal
+from core.claude_client import call_betting_brain, validate_signal
 from core.db import (
     save_sports_signal, get_active_sports_signals, resolve_sports_signal,
 )
-from discord.poster import post_signal, post_health_alert
+from discord.poster import post_signal, post_health_alert, send, WEBHOOKS
 from sports.betting_math import (
     implied_prob, remove_vig, ev_edge_pct, calc_arbitrage, best_per_side,
 )
+from sports.results_tracker import resolve_completed_sports_signals
 from sports.data_clients import (
     fetch_sportsbook_odds, fetch_polymarket_sports,
     fetch_kalshi_sports, minutes_until,
@@ -46,6 +47,63 @@ from sports.data_clients import (
 log = logging.getLogger(__name__)
 
 _fingerprints: dict[str, str] = {}
+
+# ── Daily recap accumulator ────────────────────────────────────────────────────
+# Accumulates EV-only results throughout the day. Posted once at end of day
+# (when UTC hour rolls to 23) then cleared. Arbitrage excluded per spec.
+
+_daily_results: list[dict]  = []
+_last_recap_date: date | None = None
+
+
+def _record_ev_result(play: str, result: str, edge: float):
+    """Add a resolved +EV signal to today's recap buffer. Arb excluded."""
+    if result in ("WIN", "LOSS"):   # skip PUSH and VOID
+        _daily_results.append({"play": play, "result": result, "edge": edge})
+
+
+def _post_daily_recap():
+    """
+    Post the daily results summary to #sports-results and #results-preview.
+    Called once per day. Only posts if there is meaningful activity.
+    """
+    global _daily_results, _last_recap_date
+
+    if not _daily_results:
+        log.debug("No EV results today — skipping daily recap")
+        _last_recap_date = date.today()
+        return
+
+    wins   = [r for r in _daily_results if r["result"] == "WIN"]
+    losses = [r for r in _daily_results if r["result"] == "LOSS"]
+
+    notable = sorted(_daily_results, key=lambda r: r["edge"], reverse=True)[:5]
+    plays_text = "\n".join(
+        f"{'✅' if r['result'] == 'WIN' else '❌'} {r['play']} → {r['result']}"
+        for r in notable
+    )
+
+    sep     = "─────────────────────────────"
+    today   = date.today().strftime("%B %d, %Y")
+    summary = (
+        f"{sep}\n"
+        f"📊 **DAILY RESULTS — {today}**\n"
+        f"✅ Wins: **{len(wins)}**  |  ❌ Losses: **{len(losses)}**\n\n"
+        f"📈 Notable +EV plays:\n{plays_text}\n"
+        f"{sep}"
+    )
+    preview = (
+        f"📊 **Daily recap is live** — {len(wins)}W / {len(losses)}L today.\n"
+        f"Full breakdown in #sports-results.\n"
+        f"🔓 Unlock signals: https://whop.com/the-sharp-margin"
+    )
+
+    send(WEBHOOKS.get("sports_results", ""), summary)
+    send(WEBHOOKS.get("results_preview", ""), preview)
+    log.info("Daily recap posted: %dW %dL", len(wins), len(losses))
+
+    _daily_results     = []
+    _last_recap_date   = date.today()
 
 
 def _fp(data: dict) -> str:
@@ -118,11 +176,39 @@ def _scan_ev(game: dict, mins: float) -> list:
     return opportunities
 
 
+def _is_two_way_market(books: dict, home: str, away: str) -> bool:
+    """
+    Return True only if every book's h2h market has exactly 2 outcomes
+    (home + away). Rejects 3-way markets (soccer Draw, etc.).
+    """
+    for bk in SOFT_BOOKS:
+        if bk not in books:
+            continue
+        entry = books.get(bk, {})
+        mkts  = entry.get("markets", []) if isinstance(entry, dict) else []
+        for mkt in mkts:
+            if mkt.get("key") != "h2h":
+                continue
+            outcomes = mkt.get("outcomes", [])
+            names    = [o["name"].lower() for o in outcomes]
+            # Reject if draw / 3-way outcome present
+            if len(outcomes) != 2:
+                return False
+            if any(n in ("draw", "tie", "push") for n in names):
+                return False
+    return True
+
+
 def _scan_arb(game: dict, mins: float) -> list:
     books   = {bm["key"]: bm for bm in game.get("bookmakers", [])} if "bookmakers" in game else game.get("books", {})
     home    = game["home_team"]
     away    = game["away_team"]
     matchup = f"{away} @ {home}"
+
+    # Only process standard 2-way moneylines — no draws, no 3-way markets
+    if not _is_two_way_market(books, home, away):
+        return []
+
     best    = best_per_side(books, home, away, SOFT_BOOKS)
     bh, ba  = best[home], best[away]
 
@@ -205,56 +291,61 @@ def _scan_polymarket(poly: list, sb_games: list) -> list:
     return opps
 
 
-# ── Result resolution ─────────────────────────────────────────────────────────
-
-def _check_results():
-    """
-    For active sports signals where the game has now started (timing expired),
-    we can't automatically know the result without a scores API.
-    This function marks them EXPIRED after 4 hours so they don't clog the DB.
-    In production, integrate a scores API (e.g. The Odds API scores endpoint)
-    to auto-resolve WIN/LOSS.
-    """
-    active = get_active_sports_signals()
-    expired = []
-    for sig in active:
-        created = datetime.fromisoformat(sig["created_at"])
-        age_hrs = (datetime.utcnow() - created).total_seconds() / 3600
-        if age_hrs > 4:
-            expired.append(sig)
-
-    if expired:
-        summaries = []
-        for sig in expired:
-            resolve_sports_signal(sig["id"], "VOID", "Auto-expired after 4h")
-            summaries.append({
-                "signal_id":    sig["id"],
-                "matchup":      sig["matchup"],
-                "play":         sig["play"],
-                "odds":         sig["odds"],
-                "result":       "VOID",
-                "note":         "Expired — scores API not integrated",
-                "result_kind":  "sports",
-            })
-
-        # Generate result summaries via Claude
-        if summaries:
-            result_data = call_result_summary(summaries, "sports")
-            for r in result_data.get("results", []):
-                r["result_kind"] = "sports"
-                post_signal(r, "result")
-
-
 # ── Main loop ─────────────────────────────────────────────────────────────────
+
+def _resolve_and_accumulate():
+    """
+    Check for completed game results. For +EV signals, feed WIN/LOSS into the
+    daily recap buffer instead of posting individual result messages.
+    Arbitrage results are intentionally excluded from the recap.
+    """
+    from core.db import get_active_sports_signals, resolve_sports_signal
+    from sports.results_tracker import (
+        fetch_completed_scores, _teams_match, _determine_result,
+    )
+
+    active = get_active_sports_signals()
+    if not active:
+        return
+
+    completed_games = fetch_completed_scores()
+    if not completed_games:
+        return
+
+    for sig in active:
+        for game in completed_games:
+            if not _teams_match(sig.get("matchup", ""), game):
+                continue
+
+            result, note = _determine_result(sig, game)
+            if result == "VOID":
+                break
+
+            resolve_sports_signal(sig["id"], result, note)
+            log.info("Result resolved: %s — %s", sig.get("matchup"), result)
+
+            # Feed only +EV results into daily recap (not arbitrage)
+            sig_type = (sig.get("signal_type") or "").upper()
+            if sig_type != "ARBITRAGE":
+                _record_ev_result(
+                    play   = sig.get("play", sig.get("matchup", "")),
+                    result = result,
+                    edge   = float(sig.get("edge_pct", sig.get("edge", 0))),
+                )
+            break
 
 def run_odds_monitor():
     log.info("Odds monitor started — base interval %ds", SPORTS_LOOP_SECONDS)
 
-    idle_cycles = 0   # consecutive cycles with zero opportunities found
+    idle_cycles        = 0
+    cycle_count        = 0     # total cycles elapsed
+    CLAUDE_CALL_EVERY_N = 3    # call Claude at most once every N cycles
+    CLAUDE_MIN_EDGE     = 3.5  # minimum top-opportunity edge to justify a Claude call
 
     while True:
         loop_start    = time.time()
         opportunities = []
+        cycle_count  += 1
 
         try:
             sb_games   = fetch_sportsbook_odds()
@@ -281,43 +372,64 @@ def run_odds_monitor():
             opportunities.extend(_scan_polymarket(poly_mkts, sb_games))
 
             if opportunities:
-                # Reset idle counter — active market, use base interval
                 idle_cycles = 0
 
-                # Deduplicate: keep highest-edge entry per matchup+book+play combo.
-                # Collapses 100+ raw opportunities down to unique actionable entries.
-                seen: dict[str, dict] = {}
-                for opp in opportunities:
-                    key = f"{opp.get('type')}|{opp.get('matchup')}|{opp.get('book')}|{opp.get('play')}"
-                    existing = float(seen[key].get("edge", seen[key].get("arb_percentage", 0))) if key in seen else -1
-                    this     = float(opp.get("edge", opp.get("arb_percentage", 0)))
-                    if this > existing:
-                        seen[key] = opp
-                deduped = list(seen.values())
+                # ── Cooldown: skip Claude on non-qualifying cycles ────────────
+                if cycle_count % CLAUDE_CALL_EVERY_N != 0:
+                    log.debug("Claude cooldown — cycle %d (calls every %d cycles)",
+                              cycle_count, CLAUDE_CALL_EVERY_N)
+                else:
+                    # ── Edge threshold: only call if best opp clears minimum ──
+                    best_edge = max(
+                        float(o.get("edge", o.get("arb_percentage", 0)))
+                        for o in opportunities
+                    )
+                    if best_edge < CLAUDE_MIN_EDGE:
+                        log.debug("Claude skipped — best edge %.2f%% below %.1f%% threshold",
+                                  best_edge, CLAUDE_MIN_EDGE)
+                    else:
+                        # ✅ SORT AND LIMIT INPUT — top 8 by edge only
+                        limited_opps = sorted(
+                            opportunities,
+                            key=lambda o: float(o.get("edge", o.get("arb_percentage", 0))),
+                            reverse=True,
+                        )[:8]
+                        log.info("Sending %d opportunities to Claude (best edge: %.2f%%)",
+                                 len(limited_opps), best_edge)
+                        result = call_betting_brain(limited_opps, data_quality)
 
-                # Limit and prioritize best opportunities before sending to Claude
-                limited_opps = sorted(
-                    opportunities,
-                    key=lambda o: float(o.get("edge", o.get("arb_percentage", 0))),
-                    reverse=True,
-                )[:10]
-                log.info("Sending %d opportunities to Claude", len(limited_opps))
-                result = call_betting_brain(limited_opps, data_quality)
-
-                for signal in result.get("signals", []):
-                    check = validate_signal(signal)
-                    if not check.get("approved", True):
-                        log.info("Signal rejected: %s", check.get("reason"))
-                        continue
-                    signal["confidence"] = check.get("adjusted_confidence", signal.get("confidence", 5))
-                    save_sports_signal(signal)
-                    post_signal(signal, "sports")
+                        for signal in result.get("signals", []):
+                            check = validate_signal(signal)
+                            if not check.get("approved", True):
+                                log.info("Signal rejected: %s", check.get("reason"))
+                                continue
+                            signal["confidence"] = check.get("adjusted_confidence",
+                                                             signal.get("confidence", 5))
+                            save_sports_signal(signal)
+                            post_signal(signal, "sports")
+                            try:
+                                from content.publisher import whop_post_sports_signal
+                                whop_post_sports_signal(
+                                    matchup = signal.get("matchup", ""),
+                                    play    = signal.get("play", ""),
+                                    edge    = float(signal.get("edge", 0)),
+                                    book    = signal.get("book", ""),
+                                )
+                            except Exception:
+                                pass
             else:
                 idle_cycles += 1
                 log.debug("No opportunities this cycle (idle streak: %d)", idle_cycles)
 
-            # Check for results / expirations
-            _check_results()
+            # Resolve completed game results — feed EV results into daily recap buffer.
+            # Individual result posts are suppressed; recap posts once at end of day.
+            _resolve_and_accumulate()
+
+            # Trigger daily recap once per day at 23:00 UTC
+            now_utc = datetime.utcnow()
+            if (now_utc.hour == 23
+                    and (_last_recap_date is None or _last_recap_date < date.today())):
+                _post_daily_recap()
 
         except Exception as e:
             log.error("odds_monitor error: %s", e)

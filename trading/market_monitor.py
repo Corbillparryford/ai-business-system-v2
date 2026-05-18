@@ -24,7 +24,7 @@ from core.config import (
     ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL,
     TRADING_WATCHLIST, TRADING_LOOP_SECONDS,
 )
-from core.claude_client import call_trading_brain, call_result_summary, validate_signal
+from core.claude_client import call_trading_brain, validate_signal
 from core.db import (
     save_trading_signal, get_active_trading_signals,
     close_trading_signal, invalidate_trading_signal,
@@ -116,7 +116,6 @@ def _process_target_hit(hit: dict):
     outcome     = hit.get("outcome", "")
     close_price = hit.get("close_price", 0.0)
     pnl_pct     = hit.get("pnl_pct", 0.0)
-    update_text = hit.get("update_text", "")
 
     # Fetch signal from DB
     sig = get_trading_signal_by_ticker(ticker)
@@ -127,34 +126,23 @@ def _process_target_hit(hit: dict):
     # Close in DB
     close_trading_signal(sig["id"], outcome, close_price, pnl_pct)
 
-    # Post update to #trade-updates
-    update_msg = {
-        "ticker":      ticker,
-        "outcome":     outcome,
-        "close_price": close_price,
-        "pnl_pct":     pnl_pct,
-        "update_text": update_text,
-    }
-    post_signal(update_msg, "update")
-
-    # If terminal outcome (not just T1), post full result
+    # Only post to Discord on terminal outcomes (full exit, not intermediate target)
+    # TARGET_1 is an intermediate milestone — suppressed to avoid noise.
+    # TARGET_2 and STOP are the final exit — post the clean SELL format.
     if outcome in ("TARGET_2", "STOP"):
-        completed = [{
-            "signal_id":   sig["id"],
+        exit_signal = {
             "ticker":      ticker,
-            "signal_type": sig["signal_type"],
-            "pattern":     sig.get("pattern"),
-            "entry_price": sig.get("entry_price"),
-            "close_price": close_price,
             "outcome":     outcome,
+            "close_price": close_price,
             "pnl_pct":     pnl_pct,
-            "reasoning":   sig.get("reasoning"),
-            "result_kind": "trading",
-        }]
-        result_data = call_result_summary(completed, "trading")
-        for r in result_data.get("results", []):
-            r["result_kind"] = "trading"
-            post_signal(r, "result")
+            "update_text": f"{ticker} closed at ${close_price}",
+        }
+        post_signal(exit_signal, "update")   # routes to _fmt_trade_exit
+        log.info("Trade exit posted: %s %s @ $%s (P&L: %.2f%%)",
+                 ticker, outcome, close_price, pnl_pct)
+    else:
+        log.info("TARGET_1 hit for %s @ $%s — holding for TARGET_2 (no Discord post)",
+                 ticker, close_price)
 
     _push_ws({"type": "SIGNAL_INVALIDATED", "ticker": ticker})
 
@@ -163,29 +151,61 @@ def _process_target_hit(hit: dict):
 
 def run_market_monitor():
     log.info("Market monitor started")
+
+    cycle_count         = 0
+    CLAUDE_CALL_EVERY_N = 3   # call Claude at most once every N cycles
+    MIN_PATTERNS        = 1   # minimum pattern count to justify a Claude call
+
     while True:
-        loop_start = time.time()
+        loop_start  = time.time()
+        cycle_count += 1
         try:
             if not is_market_hours():
                 time.sleep(60)
                 continue
 
-            # Build analysis payload
+            active = get_active_trading_signals()
+
+            # Build analysis payload — log bar fetch results for diagnostics
             analysis = []
+            bars_found = 0
+            patterns_found = 0
             for ticker in TRADING_WATCHLIST:
                 bars   = _fetch_bars(ticker)
+                if bars:
+                    bars_found += 1
                 result = analyse_ticker(ticker, bars)
                 if result.get("has_patterns"):
                     analysis.append(result)
+                    patterns_found += 1
 
-            active = get_active_trading_signals()
+            log.info("Bar data: %d/%d tickers | Patterns: %d | Active signals: %d",
+                     bars_found, len(TRADING_WATCHLIST), patterns_found, len(active))
 
-            if analysis or active:
+            # Call Claude only when there is something actionable:
+            # patterns detected OR active signals needing invalidation checks.
+            # Also enforce cooldown: skip Claude on non-qualifying cycles.
+            has_work    = bool(analysis) or bool(active)
+            on_schedule = (cycle_count % CLAUDE_CALL_EVERY_N == 0)
+            enough_patterns = patterns_found >= MIN_PATTERNS or bool(active)
+
+            should_call = has_work and on_schedule and enough_patterns
+
+            if has_work and not on_schedule:
+                log.debug("Trading Claude cooldown — cycle %d (calls every %d)",
+                          cycle_count, CLAUDE_CALL_EVERY_N)
+
+            if should_call:
                 result = call_trading_brain(
                     analysis, active,
                     market_condition=get_market_condition(),
                     vix=get_vix(),
                 )
+
+                log.info("Trading brain returned: %d signals, %d hits, %d invalidations",
+                         len(result.get("signals", [])),
+                         len(result.get("targets_hit", [])),
+                         len(result.get("signals_invalidated", [])))
 
                 # ── Process target / stop hits ────────────────────────────────
                 for hit in result.get("targets_hit", []):
@@ -209,22 +229,35 @@ def run_market_monitor():
                 # ── Process new signals ───────────────────────────────────────
                 active_tickers = {s["ticker"] for s in active if s["status"] == "ACTIVE"}
                 for signal in result.get("signals", []):
-                    if signal["ticker"] in active_tickers:
+                    if signal.get("ticker") in active_tickers:
+                        log.debug("Skipping %s — already have active signal", signal.get("ticker"))
                         continue
                     check = validate_signal(signal)
                     if not check.get("approved", True):
-                        log.info("Signal rejected: %s — %s",
-                                 signal["ticker"], check.get("reason"))
+                        log.info("Signal rejected by validation: %s — %s",
+                                 signal.get("ticker"), check.get("reason"))
                         continue
                     signal["confidence"] = check.get("adjusted_confidence",
                                                       signal.get("confidence", 5))
                     save_trading_signal(signal)
                     post_signal(signal, "trading")
+                    # Post teaser to Whop (entry/stop details excluded)
+                    try:
+                        from content.publisher import whop_post_trading_signal
+                        whop_post_trading_signal(
+                            ticker     = signal.get("ticker", ""),
+                            action     = signal.get("signal_type", "BUY"),
+                            confidence = int(signal.get("confidence", 5)),
+                        )
+                    except Exception:
+                        pass
                     _push_ws({"type": "NEW_SIGNAL", "signal": signal})
-                    log.info("Signal posted: %s %s", signal["signal_type"], signal["ticker"])
+                    log.info("✅ Trading signal posted: %s %s @ $%s",
+                             signal.get("signal_type"), signal.get("ticker"),
+                             signal.get("entry_price"))
 
             else:
-                log.debug("No patterns and no active signals — skipping Claude call")
+                log.info("No bar data, no patterns, no active signals — skipping Claude call")
 
         except Exception as e:
             log.error("market_monitor error: %s", e)
