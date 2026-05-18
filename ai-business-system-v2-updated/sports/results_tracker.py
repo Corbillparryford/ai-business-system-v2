@@ -257,36 +257,39 @@ def _format_result(signal: dict, result: str, note: str) -> dict:
 def resolve_completed_sports_signals():
     """
     Called each odds_monitor cycle. Fetches completed scores, matches
-    active signals, determines WIN/LOSS/PUSH, posts results to Discord.
-    Falls back to expiry-based VOID after 8 hours if no score data found.
+    active signals to game results, determines WIN/LOSS/PUSH.
+
+    IMPORTANT: Only posts a result when real score data is found.
+    If no score match is found, the signal remains ACTIVE silently.
+    No placeholder, no VOID, no auto-expiry.
     """
     active = get_active_sports_signals()
     if not active:
         return
 
     completed_games = fetch_completed_scores()
+    if not completed_games:
+        log.debug("No completed game scores available this cycle")
+        return
 
     for sig in active:
-        resolved     = False
-        created      = datetime.fromisoformat(sig["created_at"])
-        age_hrs      = (datetime.utcnow() - created).total_seconds() / 3600
-
         # Try to match to a completed game
         for game in completed_games:
             if not _teams_match(sig.get("matchup", ""), game):
                 continue
 
             result, note = _determine_result(sig, game)
+
+            # Only post WIN / LOSS / PUSH — skip VOID results from parse failures
+            if result == "VOID":
+                log.debug("Score found but result indeterminate for %s: %s",
+                          sig.get("matchup"), note)
+                break
+
             resolve_sports_signal(sig["id"], result, note)
             result_payload = _format_result(sig, result, note)
             post_signal(result_payload, "result")
-            log.info("Sports result: %s — %s (%s)", sig.get("matchup"), result, note)
-            resolved = True
+            log.info("Sports result posted: %s — %s (%s)",
+                     sig.get("matchup"), result, note)
             break
-
-        # After 8 hours with no score match, expire the signal
-        if not resolved and age_hrs > 8:
-            resolve_sports_signal(sig["id"], "VOID", "Score data unavailable — auto-expired")
-            result_payload = _format_result(sig, "VOID", "Score unavailable — could not verify outcome")
-            post_signal(result_payload, "result")
-            log.info("Signal expired without score data: %s", sig.get("matchup"))
+        # No match found → signal stays ACTIVE, checked again next cycle

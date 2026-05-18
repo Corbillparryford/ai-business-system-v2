@@ -166,56 +166,81 @@ def _fmt_ev(signal: dict) -> str:
     )
 
 
-def _fmt_arb(signal: dict) -> str:
-    legs = signal.get("legs", [])
-    legs_text = " | ".join(
-        f"Leg {i+1}: **{l.get('side','?')}** @ {l.get('book','?')} `{l.get('odds','?')}` → ${l.get('stake','?')}"
-        for i, l in enumerate(legs)
-    )
-    return (
-        f"{SEP}\n"
-        f"⚡ **{signal.get('matchup', 'N/A')} — ARBITRAGE**\n"
-        f"💰 Profit: **{signal.get('arb_percentage', 0)}%** guaranteed "
-        f"(${signal.get('profit_per_1000', 0):.2f} / $1,000)\n"
-        f"📊 {legs_text}\n"
-        f"⏱ {signal.get('timing', 'N/A')} | Fees: {'Yes' if signal.get('fees_applied') else 'No'}\n"
-        f"💡 {_short_reason(signal.get('reasoning', ''))}\n"
-        f"{SEP}"
-    )
-
-
 def _fmt_trading(signal: dict) -> str:
-    action   = signal.get("signal_type", "BUY")
-    arrow    = "📈" if action == "BUY" else "📉"
-    strength = {"STRONG": "🟢", "MODERATE": "🟡", "WEAK": "🔴"}.get(
-        signal.get("signal_strength", "MODERATE"), "🟡"
-    )
-    t1 = signal.get("target_1", "?")
-    t2 = signal.get("target_2", "?")
+    """Clean entry signal — entry, targets, stop, confidence only."""
+    action = signal.get("signal_type", "BUY")
+    arrow  = "📈" if action == "BUY" else "📉"
+    t1     = signal.get("target_1", "?")
+    t2     = signal.get("target_2", "?")
     return (
         f"{SEP}\n"
-        f"{arrow} **{signal.get('ticker','?')} — {action}** {strength}\n"
-        f"💰 Entry: `${signal.get('entry_price','?')}` | Pattern: {signal.get('pattern','N/A')}\n"
+        f"{arrow} **{signal.get('ticker','?')} — {action}**\n"
+        f"💰 Entry: `${signal.get('entry_price','?')}`\n"
         f"🎯 Targets: `${t1}` / `${t2}`\n"
         f"🛑 Stop: `${signal.get('stop_loss','?')}`\n"
-        f"📊 R/R: **{signal.get('risk_reward','?')}:1** | Confidence: {signal.get('confidence','?')}/10\n"
-        f"💡 {_short_reason(signal.get('reasoning',''))}\n"
+        f"📊 Confidence: {signal.get('confidence','?')}/10\n"
         f"{SEP}"
     )
 
 
-def _fmt_trade_update(update: dict) -> str:
-    outcome = update.get("outcome", "UPDATE")
-    outcome_emoji = {"TARGET_1": "🎯", "TARGET_2": "🏆", "STOP": "🛑",
-                     "INVALIDATED": "⛔"}.get(outcome, "📢")
-    pnl     = update.get("pnl_pct", 0)
-    pnl_str = f"+{pnl:.2f}%" if pnl >= 0 else f"{pnl:.2f}%"
-    label   = update.get("ticker") or update.get("matchup", "?")
+def _fmt_trade_exit(ticker: str, exit_price: float, result: str, pnl_pct: float) -> str:
+    """Clean exit signal posted only on terminal trade close."""
+    arrow   = "📉" if result in ("STOP", "LOSS") else "📈"
+    outcome = "WIN" if result in ("TARGET_1", "TARGET_2") else "LOSS"
+    pnl_str = f"+{pnl_pct:.2f}%" if pnl_pct >= 0 else f"{pnl_pct:.2f}%"
     return (
         f"{SEP}\n"
-        f"📢 **UPDATE — {label}**\n"
-        f"🎯 {update.get('update_text', '')}\n"
-        f"⚡ Status: **{outcome}** | P&L: `{pnl_str}`\n"
+        f"{arrow} **{ticker} — SELL**\n"
+        f"💰 Exit: `${exit_price}`\n"
+        f"📊 Result: **{outcome}** | P&L: `{pnl_str}`\n"
+        f"{SEP}"
+    )
+
+
+def _fmt_arb(signal: dict) -> str:
+    """
+    Full two-leg arbitrage breakdown. Each leg on its own line with
+    sportsbook name, team, and exact odds clearly separated.
+    """
+    legs = signal.get("legs", [])
+
+    # Build each leg block
+    leg_lines = []
+    leg_colours = ["🔵", "🔴", "🟢"]
+    for i, leg in enumerate(legs):
+        colour = leg_colours[i] if i < len(leg_colours) else "⚪"
+        leg_lines.append(
+            f"{colour} **Bet {i+1}:**\n"
+            f"   Book: **{leg.get('book', '?')}**\n"
+            f"   Team: {leg.get('side', '?')}\n"
+            f"   Odds: `{leg.get('odds', '?')}`\n"
+            f"   Stake: **${leg.get('stake', '?')}** per $1,000"
+        )
+
+    # Fallback when legs list is empty (plain-text parser didn't extract them)
+    if not leg_lines:
+        book_str  = signal.get("book", "N/A")
+        play_str  = signal.get("play", "N/A")
+        odds_str  = signal.get("odds", "N/A")
+        leg_lines = [
+            f"🔵 **Bet 1 / 2:**\n"
+            f"   Books: **{book_str}**\n"
+            f"   Play: {play_str}\n"
+            f"   Odds: `{odds_str}`"
+        ]
+
+    legs_block = "\n".join(leg_lines)
+    profit_pct = signal.get("arb_percentage", signal.get("edge", 0))
+    profit_amt = signal.get("profit_per_1000", 0)
+
+    return (
+        f"{SEP}\n"
+        f"⚖️ **ARBITRAGE OPPORTUNITY**\n"
+        f"🏟 Match: **{signal.get('matchup', 'N/A')}**\n\n"
+        f"{legs_block}\n\n"
+        f"💰 Guaranteed Profit: **{profit_pct}%** (${profit_amt:.2f} per $1,000 staked)\n"
+        f"✅ Execute BOTH bets at these exact odds simultaneously\n"
+        f"⏱ {signal.get('timing', 'N/A')}\n"
         f"{SEP}"
     )
 
@@ -369,16 +394,37 @@ def post_signal(signal: dict, signal_type: str):
 
     # ── Results and updates skip dedup (always post) ──────────────────────────
     if signal_type == "update":
-        send(WEBHOOKS["trade_updates"], _fmt_trade_update(signal))
+        outcome = signal.get("outcome", "")
+        # Only post on terminal outcomes (full exit). TARGET_1 is suppressed —
+        # it is an intermediate milestone, not an actionable exit.
+        if outcome not in ("TARGET_2", "STOP", "INVALIDATED"):
+            log.debug("Suppressing non-terminal update: %s %s", signal.get("ticker"), outcome)
+            return
+        if outcome == "INVALIDATED":
+            # Simple invalidation notice — not a trade exit
+            send(WEBHOOKS["trade_updates"],
+                 f"{SEP}\n⛔ **{signal.get('ticker','?')} — SIGNAL CANCELLED**\n"
+                 f"{signal.get('update_text','Stop level breached.')}\n{SEP}")
+            return
+        # Terminal exit — use clean SELL format
+        msg = _fmt_trade_exit(
+            ticker     = signal.get("ticker", "?"),
+            exit_price = signal.get("close_price", 0.0),
+            result     = outcome,
+            pnl_pct    = signal.get("pnl_pct", 0.0),
+        )
+        send(WEBHOOKS["trade_updates"], msg)
         return
 
     if signal_type == "result":
-        result_kind = signal.get("result_kind", "trading")  # "sports" or "trading"
+        result_kind = signal.get("result_kind", "trading")
         if result_kind == "sports":
-            send(WEBHOOKS["sports_results"], _fmt_sports_result(signal))
+            # Individual sports results are suppressed — handled by daily recap
+            log.debug("Individual sports result suppressed (daily recap handles this)")
+            return
         else:
             send(WEBHOOKS["trade_results"], _fmt_trade_result(signal))
-        send(WEBHOOKS["results_preview"], _fmt_results_preview(signal))
+            send(WEBHOOKS["results_preview"], _fmt_results_preview(signal))
         return
 
     if signal_type == "health":
@@ -420,7 +466,28 @@ def post_signal(signal: dict, signal_type: str):
         return
 
     send(webhook, message)
-    send(WEBHOOKS["free"], teaser)
+
+    # Free channel: only post standout signals — high confidence AND significant edge.
+    # Routine signals are suppressed to preserve free channel quality and reduce spam.
+    FREE_MIN_CONFIDENCE = 8
+    FREE_MIN_EDGE       = 5.0
+
+    if signal_type == "sports":
+        confidence = signal.get("confidence", 0)
+        edge       = float(signal.get("edge", signal.get("arb_percentage", 0)))
+        if confidence >= FREE_MIN_CONFIDENCE and edge >= FREE_MIN_EDGE:
+            send(WEBHOOKS["free"], teaser)
+        else:
+            log.debug("Free channel suppressed (confidence=%s edge=%s): %s",
+                      confidence, edge, signal.get("matchup", ""))
+
+    elif signal_type == "trading":
+        confidence = signal.get("confidence", 0)
+        if confidence >= FREE_MIN_CONFIDENCE:
+            send(WEBHOOKS["free"], teaser)
+        else:
+            log.debug("Free channel suppressed (confidence=%s): %s",
+                      confidence, signal.get("ticker", ""))
 
     cache[sig_hash] = {"signal": signal, "posted_at": now(), "ttl_minutes": ttl}
     save_cache(cache)
