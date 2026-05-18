@@ -1,9 +1,0 @@
-anthropic>=0.28.0
-requests>=2.31.0
-websockets>=12.0
-pytz>=2024.1
-moviepy>=1.0.3
-python-dotenv>=1.0.0
-imageio>=2.33.0
-imageio-ffmpeg>=0.4.9
-numpy>=1.24.0
