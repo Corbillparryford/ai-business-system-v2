@@ -169,12 +169,18 @@ def _call(prompt: str, max_tokens: int = 2000, temperature: float = 0.0) -> dict
             )
             raw = resp.content[0].text
 
-            parsed = _extract_json(raw)
+            raw = resp.content[0].text
+            import json
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                parsed = None
             if not parsed:
-                log.error("Claude returned invalid or empty JSON")
+                log.error("Claude returned invalid JSON")
                 return None
-
+                
             return parsed
+
 
         except anthropic.RateLimitError:
             wait = 10 * attempt
