@@ -54,6 +54,7 @@ DISCORD_WEBHOOK_ANNOUNCEMENTS   = _optional("DISCORD_WEBHOOK_ANNOUNCEMENTS")
 
 # ── Discord — SYSTEM ───────────────────────────────────────────────────────────
 DISCORD_WEBHOOK_HEALTH = _optional("DISCORD_WEBHOOK_HEALTH")
+DISCORD_WEBHOOK_CONTENT = _optional("DISCORD_WEBHOOK_CONTENT")
 
 # ── Content (optional) ─────────────────────────────────────────────────────────
 ELEVENLABS_API_KEY     = _optional("ELEVENLABS_API_KEY")
