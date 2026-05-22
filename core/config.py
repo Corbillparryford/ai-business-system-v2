@@ -112,9 +112,9 @@ SHARP_BOOKS = ["pinnacle"]
 DB_PATH    = "signals.db"
 CACHE_FILE = "signal_cache.json"
 
+# ── Monetization ─────────────────────────────────────────────────────
 
-
-
+WHOP_STORE_URL = "https://whop.com/the-sharp-margin"
 
 # ── Free channel controls (MASTER CONFIG) ─────────────────────────────
 
