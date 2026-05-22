@@ -193,7 +193,40 @@ https://whop.com/@thesharpmargin
 
 # ── SIGNAL POSTING (UNCHANGED CORE) ──────────────────────
 
+def _load_cache():
+    try:
+        with open(CACHE_FILE) as f:
+            return json.load(f)
+    except:
+        return {}
+
+def _save_cache(cache):
+    try:
+        with open(CACHE_FILE, "w") as f:
+            json.dump(cache, f)
+    except:
+        pass
+
+def _signal_key(signal):
+    return hashlib.md5(
+        (signal.get("matchup","") + signal.get("play","")).encode()
+    ).hexdigest()
+
+
 def post_signal(signal: dict, signal_type: str):
+
+    cache = _load_cache()
+
+    key = _signal_key(signal)
+
+    # ✅ BLOCK DUPLICATES
+    if key in cache:
+        return
+
+    cache[key] = True
+    _save_cache(cache)
+
+    # ── NORMAL POSTING ──
 
     if signal_type == "sports":
         webhook = WEBHOOKS["sports_ev"]
@@ -218,6 +251,7 @@ Entry: {signal.get('entry_price')}
         return
 
     send(webhook, msg)
+
 
 
 # ── DAILY RECAP (ENHANCED WITH CONTENT) ──────────────────
