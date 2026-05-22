@@ -112,9 +112,18 @@ SHARP_BOOKS = ["pinnacle"]
 DB_PATH    = "signals.db"
 CACHE_FILE = "signal_cache.json"
 
-# ── Free channel controls ─────────────────────────────────────────────
 
-FREE_MIN_CONF_SPORTS = 7     # min confidence for free posts
-FREE_MIN_EDGE_SPORTS = 4.0   # min edge % for free posts
-FREE_MAX_POSTS_PER_DAY = 2   # hard daily cap
+# ── Free channel controls (GLOBAL) ─────────────────────────────────────
+
+# SPORTS (free content filters)
+FREE_MIN_CONF_SPORTS = 7
+FREE_MIN_EDGE_SPORTS = 4.0
+
+# TRADING (free content filters)
+FREE_MIN_CONF_TRADING = 7
+FREE_MIN_RR_TRADING = 1.8
+
+# GLOBAL LIMITS
+FREE_MAX_POSTS_PER_DAY = 2
+FREE_MIN_TIME_BETWEEN_POSTS = 1800  # 30 minutes
 
