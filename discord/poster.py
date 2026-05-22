@@ -1,7 +1,7 @@
 
 """
 discord/poster.py — THE SHARP MARGIN Discord delivery engine
-+ CONTENT QUEUE SYSTEM (PRIVATE CHANNEL FOR SOCIAL POSTS)
+CLEAN VERSION (Stable + Dedup + Proper Formatting + Content Queue)
 """
 
 import hashlib
@@ -25,27 +25,24 @@ from core.config import (
     FREE_WIN_TRIGGER,
     FREE_HIGH_EDGE_TRIGGER,
     FREE_MAX_POSTS_PER_DAY,
-    WHOP_STORE_URL,
 )
 
 log = logging.getLogger(__name__)
 SEP = "─────────────────────────────"
 
-# ── Webhooks ─────────────────────────────────────────────
+# ── WEBHOOK MAP ─────────────────────────────────────────
 
 WEBHOOKS = {
     "sports_ev": DISCORD_WEBHOOK_EV,
-    "sports_arb": DISCORD_WEBHOOK_ARB,
-    "sports_results": DISCORD_WEBHOOK_SPORTS_RESULTS,
     "trading": DISCORD_WEBHOOK_TRADING,
-    "trade_updates": DISCORD_WEBHOOK_TRADE_UPDATES,
     "free": DISCORD_WEBHOOK_FREE,
+    "sports_results": DISCORD_WEBHOOK_SPORTS_RESULTS,
     "results_preview": DISCORD_WEBHOOK_RESULTS_PREVIEW,
     "health": DISCORD_WEBHOOK_HEALTH,
-    "content": DISCORD_WEBHOOK_CONTENT,   # ✅ NEW
+    "content": DISCORD_WEBHOOK_CONTENT,
 }
 
-# ── Generic sender ───────────────────────────────────────
+# ── SEND HELPER ─────────────────────────────────────────
 
 def send(webhook: str, message: str):
     if not webhook:
@@ -55,143 +52,7 @@ def send(webhook: str, message: str):
     except Exception as e:
         log.error(f"Send failed: {e}")
 
-# ── CONTENT QUEUE SYSTEM (NEW CORE FEATURE) ───────────────
-
-def send_content_queue(wins: int, losses: int, best_play: str):
-    """
-    Sends daily content (image prompt + captions) to your private Discord channel.
-    """
-
-    message = f"""
-📊 **DAILY CONTENT READY**
-
-{SEP}
-
-🎨 **IMAGE PROMPT (Nano Banana):**
-Create a sleek dark-themed financial results graphic.
-
-- Title: "Daily Results"
-- Wins: {wins} (green)
-- Losses: {losses} (red)
-- Modern fintech UI style
-- Clean typography
-- Minimal layout
-- Subtle upward performance chart
-- Premium, high-contrast Instagram-ready design
-
-{SEP}
-
-📸 **INSTAGRAM:**
-{wins} wins. {losses} losses.
-
-Another profitable day 📊
-
-Most people guess — we follow data.
-
-🔓 Join free:
-https://whop.com/@thesharpmargin
-
-{SEP}
-
-🐦 **TWITTER/X:**
-{wins}W / {losses}L.
-
-Edge > luck.
-
-https://whop.com/@thesharpmargin
-
-{SEP}
-"""
-
-    send(WEBHOOKS["content"], message)
-
-
-# ── FREE CHANNEL (WIN SYSTEM) ───────────────────────────
-
-FREE_POST_COUNT = 0
-FREE_LAST_POST_TIME = 0
-FREE_POSTED_KEYS = set()
-_win_buffer = []
-
-def _can_post_free(key: str):
-    global FREE_POST_COUNT, FREE_LAST_POST_TIME
-
-    if FREE_POST_COUNT >= FREE_MAX_POSTS_PER_DAY:
-        return False
-
-    if time.time() - FREE_LAST_POST_TIME < 1800:
-        return False
-
-    if key in FREE_POSTED_KEYS:
-        return False
-
-    return True
-
-
-def _record_free_post(key: str):
-    global FREE_POST_COUNT, FREE_LAST_POST_TIME
-    FREE_POST_COUNT += 1
-    FREE_LAST_POST_TIME = time.time()
-    FREE_POSTED_KEYS.add(key)
-
-
-def record_win(play: str, edge: float):
-    """
-    Triggered when a bet wins.
-    Handles both FREE CHANNEL + CONTENT CREATION.
-    """
-
-    if edge < 4:
-        return
-
-    global _win_buffer
-    _win_buffer.append({"play": play, "edge": edge})
-
-    if edge >= FREE_HIGH_EDGE_TRIGGER or len(_win_buffer) >= FREE_WIN_TRIGGER:
-        _fire_win_post()
-
-
-def _fire_win_post():
-    global _win_buffer
-    wins = _win_buffer
-    _win_buffer = []
-
-    if not wins:
-        return
-
-    key = "|".join([w["play"] for w in wins])
-
-    if not _can_post_free(key):
-        return
-
-    lines = "\n".join(
-        f"✅ {w['play']} (+{w['edge']:.1f}%)"
-        for w in wins[:3]
-    )
-
-    msg = f"""
-{SEP}
-🔥 **{len(wins)} WIN{'S' if len(wins)>1 else ''}**
-
-{lines}
-
-🔓 Get full signals:
-https://whop.com/@thesharpmargin
-{SEP}
-"""
-
-    send(WEBHOOKS["free"], msg)
-    _record_free_post(key)
-
-    # ✅ ALSO SEND CONTENT FOR SOCIAL MEDIA
-    send_content_queue(
-        wins=len(wins),
-        losses=0,
-        best_play=wins[0]["play"]
-    )
-
-
-# ── SIGNAL POSTING (UNCHANGED CORE) ──────────────────────
+# ── CACHE (DEDUP SYSTEM) ─────────────────────────────────
 
 def _load_cache():
     try:
@@ -203,85 +64,209 @@ def _load_cache():
 def _save_cache(cache):
     try:
         with open(CACHE_FILE, "w") as f:
-            json.dump(cache, f)
+            json.dump(cache, f, indent=2)
     except:
         pass
 
 def _signal_key(signal):
-    return hashlib.md5(
-        (signal.get("matchup","") + signal.get("play","")).encode()
-    ).hexdigest()
+    """
+    STRONG dedup key:
+    allows different books, blocks identical duplicates
+    """
+    key_str = f"{signal.get('matchup','')}|{signal.get('play','')}|{signal.get('odds','')}|{signal.get('book','')}"
+    return hashlib.md5(key_str.encode()).hexdigest()
 
+def _should_post(signal, cache):
+    key = _signal_key(signal)
+
+    if key not in cache:
+        return True, key
+
+    # allow repost if edge changes significantly
+    old_edge = float(cache[key].get("edge", 0))
+    new_edge = float(signal.get("edge", 0))
+
+    if abs(new_edge - old_edge) >= 1.0:
+        return True, key
+
+    return False, key
+
+# ── FORMATTERS ──────────────────────────────────────────
+
+def _fmt_ev(signal):
+    return (
+        f"{SEP}\n"
+        f"🎯 **{signal.get('matchup','N/A')}**\n"
+        f"📊 **Play:** {signal.get('play','N/A')} @ **{signal.get('book','N/A')}**\n"
+        f"💰 Odds: `{signal.get('odds','N/A')}` | 📈 Edge: **+{signal.get('edge',0)}%**\n"
+        f"🧠 Confidence: {signal.get('confidence',0)}/10\n"
+        f"⏱ {signal.get('timing','N/A')}\n"
+        f"💡 {signal.get('reasoning','')}\n"
+        f"{SEP}"
+    )
+
+def _fmt_trading(signal):
+    return (
+        f"{SEP}\n"
+        f"📈 **{signal.get('ticker','N/A')} — {signal.get('signal_type','BUY')}**\n"
+        f"💰 Entry: `${signal.get('entry_price','N/A')}`\n"
+        f"🎯 Targets: `${signal.get('target_1','N/A')}` / `${signal.get('target_2','N/A')}`\n"
+        f"🛑 Stop: `${signal.get('stop_loss','N/A')}`\n"
+        f"📊 Confidence: {signal.get('confidence','N/A')}/10\n"
+        f"💡 {signal.get('reasoning','')}\n"
+        f"{SEP}"
+    )
+
+# ── MAIN SIGNAL POST ─────────────────────────────────────
 
 def post_signal(signal: dict, signal_type: str):
 
     cache = _load_cache()
+    allowed, key = _should_post(signal, cache)
 
-    key = _signal_key(signal)
-
-    # ✅ BLOCK DUPLICATES
-    if key in cache:
+    if not allowed:
         return
 
-    cache[key] = True
+    # store signal
+    cache[key] = {
+        "edge": signal.get("edge", 0),
+        "time": datetime.utcnow().isoformat()
+    }
     _save_cache(cache)
 
-    # ── NORMAL POSTING ──
-
     if signal_type == "sports":
-        webhook = WEBHOOKS["sports_ev"]
-        msg = f"""
-{SEP}
-🎯 **{signal.get('matchup')}**
-💰 {signal.get('play')}
-Edge: +{signal.get('edge')}%
-{SEP}
-"""
+        msg = _fmt_ev(signal)
+        send(WEBHOOKS["sports_ev"], msg)
 
     elif signal_type == "trading":
-        webhook = WEBHOOKS["trading"]
-        msg = f"""
-{SEP}
-📈 **{signal.get('ticker')}**
-Entry: {signal.get('entry_price')}
-{SEP}
-"""
+        msg = _fmt_trading(signal)
+        send(WEBHOOKS["trading"], msg)
 
-    else:
+# ── FREE CHANNEL SYSTEM ─────────────────────────────────
+
+FREE_POST_COUNT = 0
+FREE_LAST_POST_TIME = 0
+FREE_POSTED_KEYS = set()
+_win_buffer = []
+
+def _can_post_free(key):
+    if FREE_POST_COUNT >= FREE_MAX_POSTS_PER_DAY:
+        return False
+
+    if time.time() - FREE_LAST_POST_TIME < 1800:
+        return False
+
+    if key in FREE_POSTED_KEYS:
+        return False
+
+    return True
+
+def _record_free_post(key):
+    global FREE_POST_COUNT, FREE_LAST_POST_TIME
+    FREE_POST_COUNT += 1
+    FREE_LAST_POST_TIME = time.time()
+    FREE_POSTED_KEYS.add(key)
+
+def record_win(play, edge):
+
+    if edge < 4:
         return
 
-    send(webhook, msg)
+    global _win_buffer
+    _win_buffer.append({"play": play, "edge": edge})
 
+    if edge >= FREE_HIGH_EDGE_TRIGGER or len(_win_buffer) >= FREE_WIN_TRIGGER:
+        _fire_win_blast()
 
+def _fire_win_blast():
+    global _win_buffer
 
-# ── DAILY RECAP (ENHANCED WITH CONTENT) ──────────────────
+    wins = _win_buffer
+    _win_buffer = []
 
-def post_daily_recap(results: list[dict]):
+    if not wins:
+        return
+
+    key = "|".join(sorted(w["play"] for w in wins))
+
+    if not _can_post_free(key):
+        return
+
+    lines = "\n".join(
+        f"✅ {w['play']} (+{w['edge']:.1f}%)"
+        for w in wins[:3]
+    )
+
+    message = (
+        f"{SEP}\n"
+        f"🔥 **{len(wins)} WIN{'S' if len(wins) > 1 else ''}**\n\n"
+        f"{lines}\n\n"
+        f"🔓 https://whop.com/@thesharpmargin\n"
+        f"{SEP}"
+    )
+
+    send(WEBHOOKS["free"], message)
+    _record_free_post(key)
+
+# ── DAILY CONTENT QUEUE ─────────────────────────────────
+
+def send_content_queue(wins, losses):
+
+    message = f"""
+📊 CONTENT READY
+
+{SEP}
+
+🎨 IMAGE PROMPT:
+Dark fintech dashboard showing:
+Wins: {wins}
+Losses: {losses}
+Minimal, modern, high contrast.
+
+{SEP}
+
+📸 INSTAGRAM:
+{wins}-{losses} today.
+
+Most people guess.
+We don’t.
+
+https://whop.com/@thesharpmargin
+
+{SEP}
+
+🐦 TWITTER:
+{wins}-{losses}.
+
+Books mispriced again.
+
+https://whop.com/@thesharpmargin
+"""
+
+    send(WEBHOOKS["content"], message)
+
+# ── DAILY RECAP ─────────────────────────────────────────
+
+def post_daily_recap(results):
 
     wins = len([r for r in results if r["result"] == "WIN"])
     losses = len([r for r in results if r["result"] == "LOSS"])
 
-    recap = f"""
-{SEP}
-📊 DAILY RESULTS
+    summary = (
+        f"{SEP}\n"
+        f"📊 DAILY RESULTS\n\n"
+        f"✅ Wins: {wins}\n"
+        f"❌ Losses: {losses}\n\n"
+        f"🔓 https://whop.com/@thesharpmargin\n"
+        f"{SEP}"
+    )
 
-✅ Wins: {wins}
-❌ Losses: {losses}
+    send(WEBHOOKS["sports_results"], summary)
+    send(WEBHOOKS["results_preview"], summary)
 
-🔓 https://whop.com/@thesharpmargin
-{SEP}
-"""
-
-    send(WEBHOOKS["sports_results"], recap)
-    send(WEBHOOKS["results_preview"], recap)
-
-    # ✅ ALSO SEND CONTENT FOR SOCIALS
-    best = results[0]["play"] if results else "No standout play"
-
-    send_content_queue(wins, losses, best)
-
+    send_content_queue(wins, losses)
 
 # ── HEALTH ──────────────────────────────────────────────
 
-def post_health_alert(system: str, error: str):
+def post_health_alert(system, error):
     send(WEBHOOKS["health"], f"⚠️ {system}: {error}")
