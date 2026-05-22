@@ -113,17 +113,26 @@ DB_PATH    = "signals.db"
 CACHE_FILE = "signal_cache.json"
 
 
+
 # ── Free channel controls (GLOBAL) ─────────────────────────────────────
 
-# SPORTS (free content filters)
+# SPORTS FILTERING
 FREE_MIN_CONF_SPORTS = 7
 FREE_MIN_EDGE_SPORTS = 4.0
 
-# TRADING (free content filters)
+# TRADING FILTERING
 FREE_MIN_CONF_TRADING = 7
 FREE_MIN_RR_TRADING = 1.8
 
-# GLOBAL LIMITS
+# WIN POSTING CONTROL
+FREE_WIN_TRIGGER = True      # only post wins
+FREE_WIN_MIN_EDGE = 4.0      # only strong wins
+
+# GLOBAL LIMITING
 FREE_MAX_POSTS_PER_DAY = 2
 FREE_MIN_TIME_BETWEEN_POSTS = 1800  # 30 minutes
+
+# DUPLICATE CONTROL
+FREE_EDGE_REPOST_DELTA = 1.0   # must change enough to repost
+
 
