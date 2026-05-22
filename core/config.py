@@ -115,36 +115,37 @@ CACHE_FILE = "signal_cache.json"
 
 
 
-# ── Free channel controls (MASTER CONFIG — DO NOT REMOVE) ─────────────
 
-# GENERAL MODE
+# ── Free channel controls (MASTER CONFIG) ─────────────────────────────
+
+# ENABLE/DISABLE FREE SYSTEM
 FREE_MODE_ENABLED = True
 
-# SPORTS FILTERING
-FREE_MIN_CONF_SPORTS = 7
-FREE_MIN_EDGE_SPORTS = 4.0
-FREE_HIGH_EDGE_TRIGGER = 6.0   # high-value edge threshold
+# ── SPORTS FILTERING ──────────────────────────────────────────────────
+FREE_MIN_CONF_SPORTS = 7        # minimum confidence to qualify
+FREE_MIN_EDGE_SPORTS = 4.0      # minimum edge (%)
+FREE_HIGH_EDGE_TRIGGER = 6.0    # instant post if edge >= this
 
-# TRADING FILTERING
-FREE_MIN_CONF_TRADING = 7
-FREE_MIN_RR_TRADING = 1.8
-FREE_TRADE_TRIGGER = True
+# ── TRADING FILTERING ─────────────────────────────────────────────────
+FREE_MIN_CONF_TRADING = 7       # minimum confidence
+FREE_MIN_RR_TRADING = 1.8       # minimum risk/reward ratio
 
-# WIN-ONLY LOGIC
-FREE_WIN_TRIGGER = True
-FREE_WIN_MIN_EDGE = 4.0
-FREE_WIN_MIN_CONFIDENCE = 7
+# ── WIN-ONLY LOGIC (CRITICAL) ─────────────────────────────────────────
+FREE_WIN_TRIGGER = 3            # number of wins to trigger a post
+FREE_WIN_MIN_EDGE = 4.0         # ignore weak wins
+FREE_WIN_MIN_CONFIDENCE = 7     # ignore low-confidence wins
 
-# DUPLICATE CONTROL
-FREE_EDGE_REPOST_DELTA = 1.0
+# ── DUPLICATE CONTROL ─────────────────────────────────────────────────
+FREE_EDGE_REPOST_DELTA = 1.0    # min edge change required to repost
 
-# RATE LIMITING
-FREE_MAX_POSTS_PER_DAY = 2
-FREE_MIN_TIME_BETWEEN_POSTS = 1800  # 30 minutes
+# ── RATE LIMITING (ANTI-SPAM) ─────────────────────────────────────────
+FREE_MAX_POSTS_PER_DAY = 2      # HARD cap
+FREE_MIN_TIME_BETWEEN_POSTS = 1800  # seconds (30 minutes)
 
-# SAFETY FALLBACKS
-FREE_ALLOW_FALLBACK_POSTS = False
-FREE_REQUIRE_STRICT_FILTERS = True
+# ── SAFETY / FALLBACKS ────────────────────────────────────────────────
+FREE_ALLOW_FALLBACK_POSTS = False   # never post if rules fail
+FREE_REQUIRE_STRICT_FILTERS = True  # enforce all conditions
+
 
 
 
