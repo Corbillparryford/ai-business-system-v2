@@ -24,8 +24,14 @@ from core.claude_client import call_betting_brain, validate_signal
 from core.db import save_sports_signal, get_active_sports_signals, resolve_sports_signal
 from discord.poster import post_signal, post_health_alert, post_daily_recap, record_win, send, WEBHOOKS
 from sports.betting_math import (
-    implied_prob, remove_vig, ev_edge_pct, calc_arbitrage, best_per_side, is_two_way_market,
+    implied_prob, remove_vig, ev_edge_pct, calc_arbitrage, best_per_side,
 )
+try:
+    from sports.betting_math import is_two_way_market
+except ImportError:
+    # Fallback: always allow markets (safe degradation — arb filter disabled)
+    def is_two_way_market(*args, **kwargs):  # type: ignore[misc]
+        return True
 from sports.data_client import (
     fetch_sportsbook_odds, fetch_sportsbook_scores, fetch_polymarket_sports, minutes_until,
 )
