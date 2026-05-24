@@ -1,8 +1,5 @@
 """
-core/config.py
-==============
-Single source of truth for all configuration.
-Every module imports from here — never reads os.environ directly.
+core/config.py — single source of truth for all configuration.
 """
 
 import os
@@ -14,139 +11,84 @@ load_dotenv()
 def _require(key: str) -> str:
     val = os.environ.get(key, "").strip()
     if not val:
-        raise SystemExit(
-            f"\n[FATAL] Required env var '{key}' is not set.\n"
-            f"Add it to .env or Railway Variables.\n"
-        )
+        raise SystemExit(f"\n[FATAL] Required env var '{key}' is not set.\n")
     return val
 
 
-def _optional(key: str, default: str = "") -> str:
+def _opt(key: str, default: str = "") -> str:
     return os.environ.get(key, default).strip()
 
 
 # ── Required ───────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = _require("ANTHROPIC_API_KEY")
 
-# ── Sports APIs ────────────────────────────────────────────────────────────────
-ODDS_API_KEY   = _optional("ODDS_API_KEY")
-KALSHI_API_KEY = _optional("KALSHI_API_KEY")
+# ── Sports ─────────────────────────────────────────────────────────────────────
+ODDS_API_KEY = _opt("ODDS_API_KEY")
 
-# ── Trading APIs ───────────────────────────────────────────────────────────────
-ALPACA_API_KEY    = _optional("ALPACA_API_KEY")
-ALPACA_SECRET_KEY = _optional("ALPACA_SECRET_KEY")
+# ── Trading ────────────────────────────────────────────────────────────────────
+ALPACA_API_KEY    = _opt("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = _opt("ALPACA_SECRET_KEY")
 ALPACA_BASE_URL   = "https://data.alpaca.markets/v2"
 
-# ── Discord — PREMIUM SPORTS ───────────────────────────────────────────────────
-DISCORD_WEBHOOK_EV             = _optional("DISCORD_WEBHOOK_EV")
-DISCORD_WEBHOOK_ARB            = _optional("DISCORD_WEBHOOK_ARB")
-DISCORD_WEBHOOK_SPORTS_RESULTS = _optional("DISCORD_WEBHOOK_SPORTS_RESULTS")
+# ── Discord webhooks ───────────────────────────────────────────────────────────
+DISCORD_WEBHOOK_EV             = _opt("DISCORD_WEBHOOK_EV")
+DISCORD_WEBHOOK_ARB            = _opt("DISCORD_WEBHOOK_ARB")
+DISCORD_WEBHOOK_SPORTS_RESULTS = _opt("DISCORD_WEBHOOK_SPORTS_RESULTS")
+DISCORD_WEBHOOK_TRADING        = _opt("DISCORD_WEBHOOK_TRADING")
+DISCORD_WEBHOOK_TRADE_UPDATES  = _opt("DISCORD_WEBHOOK_TRADE_UPDATES")
+DISCORD_WEBHOOK_FREE           = _opt("DISCORD_WEBHOOK_FREE")
+DISCORD_WEBHOOK_RESULTS_PREVIEW = _opt("DISCORD_WEBHOOK_RESULTS_PREVIEW")
+DISCORD_WEBHOOK_HEALTH         = _opt("DISCORD_WEBHOOK_HEALTH")
+DISCORD_WEBHOOK_CONTENT        = _opt("DISCORD_WEBHOOK_CONTENT")
 
-# ── Discord — PREMIUM TRADING ──────────────────────────────────────────────────
-DISCORD_WEBHOOK_TRADING        = _optional("DISCORD_WEBHOOK_TRADING")
-DISCORD_WEBHOOK_TRADE_UPDATES  = _optional("DISCORD_WEBHOOK_TRADE_UPDATES")
-DISCORD_WEBHOOK_TRADE_RESULTS  = _optional("DISCORD_WEBHOOK_TRADE_RESULTS")
-
-# ── Discord — FREE FUNNEL ──────────────────────────────────────────────────────
-DISCORD_WEBHOOK_FREE            = _optional("DISCORD_WEBHOOK_FREE")
-DISCORD_WEBHOOK_RESULTS_PREVIEW = _optional("DISCORD_WEBHOOK_RESULTS_PREVIEW")
-DISCORD_WEBHOOK_ANNOUNCEMENTS   = _optional("DISCORD_WEBHOOK_ANNOUNCEMENTS")
-
-# ── Discord — SYSTEM ───────────────────────────────────────────────────────────
-DISCORD_WEBHOOK_HEALTH = _optional("DISCORD_WEBHOOK_HEALTH")
-DISCORD_WEBHOOK_CONTENT = _optional("DISCORD_WEBHOOK_CONTENT")
-
-# ── Content (optional) ─────────────────────────────────────────────────────────
-ELEVENLABS_API_KEY     = _optional("ELEVENLABS_API_KEY")
-PEXELS_KEY             = _optional("PEXELS_KEY")
-TIKTOK_ACCESS_TOKEN    = _optional("TIKTOK_ACCESS_TOKEN")
-INSTAGRAM_ACCESS_TOKEN = _optional("INSTAGRAM_ACCESS_TOKEN")
-INSTAGRAM_USER_ID      = _optional("INSTAGRAM_USER_ID")
-AMAZON_AFFILIATE_TAG   = _optional("AMAZON_AFFILIATE_TAG")
+# ── Whop ───────────────────────────────────────────────────────────────────────
+WHOP_WEBHOOK_URL = _opt("WHOP_WEBHOOK_URL")
+WHOP_STORE_URL   = "https://whop.com/the-sharp-margin"
 
 # ── Engine timing ──────────────────────────────────────────────────────────────
-SPORTS_LOOP_SECONDS  = 120   # base interval — 2 min = ~720 calls/day max
-TRADING_LOOP_SECONDS = 30
-CONTENT_LOOP_HOURS   = 3
+SPORTS_LOOP_SECONDS  = 120   # 2 min base — ~360 OddsAPI calls/day
+TRADING_LOOP_SECONDS = 60    # 1 min — market hours only
 
-# ── API budget control ─────────────────────────────────────────────────────────
-# 20,000 requests/month ÷ 30 days = 666/day ÷ 24h = ~27/hour = 1 per ~133s
-# Base loop of 120s stays comfortably under budget even with throttle reduction.
-# Dynamic throttle: after IDLE_CYCLES_THRESHOLD empty cycles, multiply sleep by
-# IDLE_BACKOFF_MULTIPLIER. Resets to base immediately when opportunities found.
-IDLE_CYCLES_THRESHOLD  = 3    # empty cycles before slowing down
-IDLE_BACKOFF_MULTIPLIER = 2   # 120s → 240s when idle (1 call per 4 min)
+# ── Claude call controls ───────────────────────────────────────────────────────
+SPORTS_CLAUDE_EVERY_N_CYCLES  = 3    # call Claude every 3rd sports cycle (6 min)
+TRADING_CLAUDE_EVERY_N_CYCLES = 2    # call Claude every 2nd trading cycle (2 min)
+SPORTS_MIN_EDGE_TO_CALL       = 3.5  # skip Claude if best edge below this %
+MAX_OPPS_TO_CLAUDE            = 6    # max opportunities sent per Claude call
 
-# ── Sports thresholds ──────────────────────────────────────────────────────────
-SPORTS_EV_MIN_EDGE = 3.0
-SPORTS_ARB_MIN_PCT = 1.5
-SPORTS_GAME_WINDOW = (0, 100000)   # no time restriction — scan all games
+# ── Signal quality thresholds ─────────────────────────────────────────────────
+SPORTS_EV_MIN_EDGE   = 3.0   # minimum +EV edge to flag opportunity
+SPORTS_ARB_MIN_PCT   = 1.5   # minimum arb profit % to flag opportunity
+TRADING_MIN_CONF     = 7     # minimum confidence to post trading signal
+TRADING_MIN_RR       = 1.8   # minimum risk/reward to post trading signal
 
-# ── Cache / dedup ──────────────────────────────────────────────────────────────
-CACHE_TTL_SPORTS      = 30
-CACHE_TTL_TRADING     = 60
-EDGE_REPOST_THRESHOLD = 1.5
+# ── Free channel control ───────────────────────────────────────────────────────
+FREE_MIN_CONF_SPORTS   = 8     # minimum confidence to post to free channel
+FREE_MIN_EDGE_SPORTS   = 6.0   # minimum edge % to post to free channel
+FREE_MIN_CONF_TRADING  = 9     # minimum confidence for free trading post
+FREE_WIN_TRIGGER       = 2     # post big-win blast after this many wins
+FREE_HIGH_EDGE_TRIGGER = 8.0   # or immediately if single win had this edge %
+FREE_MAX_POSTS_PER_DAY = 2     # hard cap on free channel posts per day
 
-# ── Lists ──────────────────────────────────────────────────────────────────────
-TRADING_WATCHLIST = [
-    "AAPL", "NVDA", "TSLA", "META", "MSFT",
-    "AMZN", "AMD",  "GOOGL", "SPY",  "QQQ",
-    "SOFI", "PLTR", "HOOD", "COIN", "ARM",
-]
+# ── Sports config ──────────────────────────────────────────────────────────────
+SOFT_BOOKS  = ["draftkings", "fanduel", "betmgm", "caesars"]
+SHARP_BOOKS = ["pinnacle"]
 
 SPORTS_KEYS = [
-    # US major leagues — highest liquidity, most soft-book inefficiency
     "americanfootball_nfl",
     "basketball_nba",
     "baseball_mlb",
     "icehockey_nhl",
-    # College — large market, frequent soft-line delays
     "basketball_ncaab",
-    # Top soccer leagues — active year-round
     "soccer_epl",
     "soccer_usa_mls",
 ]
 
-SOFT_BOOKS  = ["draftkings", "fanduel", "betmgm", "caesars"]
-SHARP_BOOKS = ["pinnacle"]
+# ── Trading watchlist ──────────────────────────────────────────────────────────
+TRADING_WATCHLIST = [
+    "AAPL", "NVDA", "TSLA", "META", "MSFT",
+    "AMZN", "AMD",  "GOOGL", "SPY",  "QQQ",
+]
 
+# ── Storage ────────────────────────────────────────────────────────────────────
 DB_PATH    = "signals.db"
 CACHE_FILE = "signal_cache.json"
-
-# ── Monetization ─────────────────────────────────────────────────────
-
-WHOP_STORE_URL = "https://whop.com/the-sharp-margin"
-
-# ── Free channel controls (MASTER CONFIG) ─────────────────────────────
-
-# ENABLE/DISABLE FREE SYSTEM
-FREE_MODE_ENABLED = True
-
-# ── SPORTS FILTERING ──────────────────────────────────────────────────
-FREE_MIN_CONF_SPORTS = 7        # minimum confidence to qualify
-FREE_MIN_EDGE_SPORTS = 4.0      # minimum edge (%)
-FREE_HIGH_EDGE_TRIGGER = 6.0    # instant post if edge >= this
-
-# ── TRADING FILTERING ─────────────────────────────────────────────────
-FREE_MIN_CONF_TRADING = 7       # minimum confidence
-FREE_MIN_RR_TRADING = 1.8       # minimum risk/reward ratio
-
-# ── WIN-ONLY LOGIC (CRITICAL) ─────────────────────────────────────────
-FREE_WIN_TRIGGER = 3            # number of wins to trigger a post
-FREE_WIN_MIN_EDGE = 4.0         # ignore weak wins
-FREE_WIN_MIN_CONFIDENCE = 7     # ignore low-confidence wins
-
-# ── DUPLICATE CONTROL ─────────────────────────────────────────────────
-FREE_EDGE_REPOST_DELTA = 1.0    # min edge change required to repost
-
-# ── RATE LIMITING (ANTI-SPAM) ─────────────────────────────────────────
-FREE_MAX_POSTS_PER_DAY = 2      # HARD cap
-FREE_MIN_TIME_BETWEEN_POSTS = 1800  # seconds (30 minutes)
-
-# ── SAFETY / FALLBACKS ────────────────────────────────────────────────
-FREE_ALLOW_FALLBACK_POSTS = False   # never post if rules fail
-FREE_REQUIRE_STRICT_FILTERS = True  # enforce all conditions
-
-
-
-
