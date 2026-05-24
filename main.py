@@ -1,18 +1,14 @@
 """
-main.py
-=======
-AI Business System v2 — Master Orchestrator.
+main.py — AI Business System v3 master orchestrator.
 
 python main.py
 
-Starts and supervises five threads:
-  sports   — odds_monitor      every 60s, always on
-  trading  — market_monitor    every 30s, market hours only
-  content  — content_engine    every 3h, always on
-  ws       — ws_broadcaster    WebSocket server on :8765
+Threads:
+  sports   — odds_monitor      every 120s (base), Claude every 3rd cycle
+  trading  — market_monitor    every 60s, market hours, Claude every 2nd cycle
+  content  — whop scheduler    every 3 hours
+  ws       — ws_broadcaster    WebSocket on :8765
   watchdog — thread health     logs every 5 min
-
-Each engine thread wraps its own restart loop.
 """
 
 import threading
@@ -32,7 +28,7 @@ def _run_sports():
             from sports.odds_monitor import run_odds_monitor
             run_odds_monitor()
         except Exception as e:
-            log.error("Sports engine crash: %s — restarting in 30s", e)
+            log.error("Sports crash: %s — restarting in 30s", e)
             time.sleep(30)
 
 
@@ -42,7 +38,7 @@ def _run_trading():
             from trading.market_monitor import run_market_monitor
             run_market_monitor()
         except Exception as e:
-            log.error("Trading engine crash: %s — restarting in 30s", e)
+            log.error("Trading crash: %s — restarting in 30s", e)
             time.sleep(30)
 
 
@@ -51,13 +47,14 @@ def _run_content():
     while True:
         try:
             start = time.time()
-            from content.content_engine import run_content_engine
-            run_content_engine()
+            from content.whop import run_scheduled_post, send_daily_content
+            run_scheduled_post()
+            send_daily_content()   # generates content every cycle (~3h)
             sleep_for = max(0.0, interval - (time.time() - start))
             log.info("Content cycle done. Next in %.1fh", sleep_for / 3600)
             time.sleep(sleep_for)
         except Exception as e:
-            log.error("Content engine crash: %s — retrying in 15 min", e)
+            log.error("Content crash: %s — retrying in 15 min", e)
             time.sleep(900)
 
 
@@ -67,7 +64,7 @@ def _run_ws():
             from trading.ws_broadcaster import run_ws_server
             run_ws_server()
         except Exception as e:
-            log.error("WS server crash: %s — restarting in 10s", e)
+            log.error("WS crash: %s — restarting in 10s", e)
             time.sleep(10)
 
 
@@ -79,16 +76,14 @@ def _run_watchdog(threads: list):
 
 
 def main():
-    log.info("=" * 62)
-    log.info("  AI Business System v2")
-    log.info("  Claude (Brain) + Manus (Executor)")
-    log.info("  Discord: 10 channels | Whop: premium monetization")
-    log.info("=" * 62)
+    log.info("=" * 60)
+    log.info("  AI Business System v3")
+    log.info("  Claude (Brain) + Executor")
+    log.info("=" * 60)
 
-    # Initialise all DB tables
     init_db()
 
-    # Wire WebSocket queue into market_monitor before threads start
+    # Wire WS queue into trading monitor before threads start
     try:
         from trading.ws_broadcaster import get_queue
         from trading import market_monitor
@@ -114,12 +109,12 @@ def main():
     )
     watchdog.start()
 
-    log.info("All systems running. Ctrl+C to stop.")
+    log.info("All systems running.")
     try:
         while True:
             time.sleep(60)
     except KeyboardInterrupt:
-        log.info("Shutdown requested.")
+        log.info("Shutdown.")
 
 
 if __name__ == "__main__":
