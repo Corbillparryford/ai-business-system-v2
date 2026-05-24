@@ -98,3 +98,4 @@ def is_two_way_market(books_data_or_market, book_keys: list[str] | None = None) 
             if any(n in ("draw", "tie", "push") for n in names):
                 return False
     return True
+    
