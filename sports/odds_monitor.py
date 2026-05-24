@@ -1,22 +1,11 @@
 """
-sports/odds_monitor.py
-======================
-Sports betting engine — runs every 120 seconds (base interval).
+sports/odds_monitor.py — Sports betting engine.
 
-Per cycle:
-  1. Fetch odds (OddsAPI + Polymarket + Kalshi)
-  2. Skip unchanged games (fingerprint cache)
-  3. Run EV and arb math
-  4. Claude validates + enriches
-  5. Post to #ev-signals / #arb-signals + #free-signals teaser
-  6. Check previously posted signals for results (game started → resolve)
-
-API budget control:
-  - Base loop: 120s → ~720 OddsAPI calls/day max (well under 666/day budget)
-  - Dynamic throttle: after IDLE_CYCLES_THRESHOLD consecutive empty cycles,
-    sleep doubles to SPORTS_LOOP_SECONDS * IDLE_BACKOFF_MULTIPLIER.
-    Resets to base immediately when opportunities are found.
-  - Fingerprint cache skips processing of unchanged odds, reducing Claude calls.
+Loop: every 120s (base). Claude called every 3rd cycle only if best edge >= 3.5%.
+Max 6 opportunities sent to Claude per call.
+Results tracked via OddsAPI scores. Daily recap posted at 23:00 UTC.
+Individual result posts suppressed — recap only.
+3-way markets (soccer draw etc.) filtered out before arb processing.
 """
 
 import hashlib
@@ -27,83 +16,27 @@ from datetime import datetime, date
 
 from core.config import (
     SOFT_BOOKS, SHARP_BOOKS,
-    SPORTS_EV_MIN_EDGE, SPORTS_ARB_MIN_PCT, SPORTS_GAME_WINDOW,
-    SPORTS_LOOP_SECONDS, IDLE_CYCLES_THRESHOLD, IDLE_BACKOFF_MULTIPLIER,
+    SPORTS_EV_MIN_EDGE, SPORTS_ARB_MIN_PCT,
+    SPORTS_LOOP_SECONDS,
+    SPORTS_CLAUDE_EVERY_N_CYCLES, SPORTS_MIN_EDGE_TO_CALL, MAX_OPPS_TO_CLAUDE,
 )
 from core.claude_client import call_betting_brain, validate_signal
-from core.db import (
-    save_sports_signal, get_active_sports_signals, resolve_sports_signal,
-)
-from discord.poster import post_signal, post_health_alert, send, WEBHOOKS
+from core.db import save_sports_signal, get_active_sports_signals, resolve_sports_signal
+from discord.poster import post_signal, post_health_alert, post_daily_recap, record_win, send, WEBHOOKS
 from sports.betting_math import (
-    implied_prob, remove_vig, ev_edge_pct, calc_arbitrage, best_per_side,
+    implied_prob, remove_vig, ev_edge_pct, calc_arbitrage, best_per_side, is_two_way_market,
 )
-from sports.results_tracker import resolve_completed_sports_signals
-from sports.data_clients import (
-    fetch_sportsbook_odds, fetch_polymarket_sports,
-    fetch_kalshi_sports, minutes_until,
+from sports.data_client import (
+    fetch_sportsbook_odds, fetch_sportsbook_scores, fetch_polymarket_sports, minutes_until,
 )
+from sports.results_tracker import record_result
 
 log = logging.getLogger(__name__)
 
-_fingerprints: dict[str, str] = {}
-
-# ── Daily recap accumulator ────────────────────────────────────────────────────
-# Accumulates EV-only results throughout the day. Posted once at end of day
-# (when UTC hour rolls to 23) then cleared. Arbitrage excluded per spec.
-
-_daily_results: list[dict]  = []
-_last_recap_date: date | None = None
-
-
-def _record_ev_result(play: str, result: str, edge: float):
-    """Add a resolved +EV signal to today's recap buffer. Arb excluded."""
-    if result in ("WIN", "LOSS"):   # skip PUSH and VOID
-        _daily_results.append({"play": play, "result": result, "edge": edge})
-
-
-def _post_daily_recap():
-    """
-    Post the daily results summary to #sports-results and #results-preview.
-    Called once per day. Only posts if there is meaningful activity.
-    """
-    global _daily_results, _last_recap_date
-
-    if not _daily_results:
-        log.debug("No EV results today — skipping daily recap")
-        _last_recap_date = date.today()
-        return
-
-    wins   = [r for r in _daily_results if r["result"] == "WIN"]
-    losses = [r for r in _daily_results if r["result"] == "LOSS"]
-
-    notable = sorted(_daily_results, key=lambda r: r["edge"], reverse=True)[:5]
-    plays_text = "\n".join(
-        f"{'✅' if r['result'] == 'WIN' else '❌'} {r['play']} → {r['result']}"
-        for r in notable
-    )
-
-    sep     = "─────────────────────────────"
-    today   = date.today().strftime("%B %d, %Y")
-    summary = (
-        f"{sep}\n"
-        f"📊 **DAILY RESULTS — {today}**\n"
-        f"✅ Wins: **{len(wins)}**  |  ❌ Losses: **{len(losses)}**\n\n"
-        f"📈 Notable +EV plays:\n{plays_text}\n"
-        f"{sep}"
-    )
-    preview = (
-        f"📊 **Daily recap is live** — {len(wins)}W / {len(losses)}L today.\n"
-        f"Full breakdown in #sports-results.\n"
-        f"🔓 Unlock signals: https://whop.com/the-sharp-margin"
-    )
-
-    send(WEBHOOKS.get("sports_results", ""), summary)
-    send(WEBHOOKS.get("results_preview", ""), preview)
-    log.info("Daily recap posted: %dW %dL", len(wins), len(losses))
-
-    _daily_results     = []
-    _last_recap_date   = date.today()
+# ── In-memory state ────────────────────────────────────────────────────────────
+_fingerprints: dict[str, str] = {}     # game_id → MD5 of books data
+_ev_results:   list[dict]     = []     # daily accumulator for recap
+_last_recap:   date | None    = None
 
 
 def _fp(data: dict) -> str:
@@ -118,34 +51,33 @@ def _changed(game_id: str, books: dict) -> bool:
     return True
 
 
-# ── Opportunity scanners ──────────────────────────────────────────────────────
+# ── Opportunity scanners ───────────────────────────────────────────────────────
 
-def _scan_ev(game: dict, mins: float) -> list:
-    books   = {bm["key"]: bm for bm in game.get("bookmakers", [])} if "bookmakers" in game else game.get("books", {})
+def _scan_ev(game: dict) -> list:
+    books   = game["books"]
     home    = game["home_team"]
     away    = game["away_team"]
     matchup = f"{away} @ {home}"
+    mins    = minutes_until(game["commence_time"])
 
     # Get Pinnacle no-vig true probs
-    pinnacle = {}
+    pinnacle_h2h = {}
     for bk in SHARP_BOOKS:
         entry = books.get(bk, {})
-        mkts  = entry.get("markets", []) if isinstance(entry, dict) else []
-        for mkt in mkts:
+        for mkt in (entry.get("markets", []) if isinstance(entry, dict) else []):
             if mkt.get("key") == "h2h":
-                pinnacle = {o["name"]: o["price"] for o in mkt.get("outcomes", [])}
+                pinnacle_h2h = {o["name"]: o["price"] for o in mkt.get("outcomes", [])}
                 break
 
-    if home not in pinnacle or away not in pinnacle:
+    if home not in pinnacle_h2h or away not in pinnacle_h2h:
         return []
 
-    true_h, true_a = remove_vig(pinnacle[home], pinnacle[away])
-    opportunities  = []
+    true_h, true_a = remove_vig(pinnacle_h2h[home], pinnacle_h2h[away])
+    opps = []
 
     for bk in SOFT_BOOKS:
         entry = books.get(bk, {})
-        mkts  = entry.get("markets", []) if isinstance(entry, dict) else []
-        for mkt in mkts:
+        for mkt in (entry.get("markets", []) if isinstance(entry, dict) else []):
             if mkt.get("key") != "h2h":
                 continue
             for o in mkt.get("outcomes", []):
@@ -155,7 +87,7 @@ def _scan_ev(game: dict, mins: float) -> list:
                     continue
                 edge = ev_edge_pct(true_p, odds)
                 if edge >= SPORTS_EV_MIN_EDGE:
-                    opportunities.append({
+                    opps.append({
                         "type":          "POSITIVE_EV",
                         "source":        "SPORTSBOOK",
                         "matchup":       matchup,
@@ -165,52 +97,25 @@ def _scan_ev(game: dict, mins: float) -> list:
                         "implied_prob":  round(implied_prob(odds) * 100, 2),
                         "true_prob":     round(true_p * 100, 2),
                         "edge":          round(edge, 2),
-                        "arb_percentage": 0.0,
-                        "profit_per_1000": 0.0,
-                        "legs":          [],
-                        "fees_applied":  False,
-                        "confidence":    0,
                         "timing":        f"{mins:.0f} min to start",
-                        "provisional":   False,
+                        "confidence":    0,
                     })
-    return opportunities
+    return opps
 
 
-def _is_two_way_market(books: dict, home: str, away: str) -> bool:
-    """
-    Return True only if every book's h2h market has exactly 2 outcomes
-    (home + away). Rejects 3-way markets (soccer Draw, etc.).
-    """
-    for bk in SOFT_BOOKS:
-        if bk not in books:
-            continue
-        entry = books.get(bk, {})
-        mkts  = entry.get("markets", []) if isinstance(entry, dict) else []
-        for mkt in mkts:
-            if mkt.get("key") != "h2h":
-                continue
-            outcomes = mkt.get("outcomes", [])
-            names    = [o["name"].lower() for o in outcomes]
-            # Reject if draw / 3-way outcome present
-            if len(outcomes) != 2:
-                return False
-            if any(n in ("draw", "tie", "push") for n in names):
-                return False
-    return True
-
-
-def _scan_arb(game: dict, mins: float) -> list:
-    books   = {bm["key"]: bm for bm in game.get("bookmakers", [])} if "bookmakers" in game else game.get("books", {})
+def _scan_arb(game: dict) -> list:
+    books   = game["books"]
     home    = game["home_team"]
     away    = game["away_team"]
     matchup = f"{away} @ {home}"
+    mins    = minutes_until(game["commence_time"])
 
-    # Only process standard 2-way moneylines — no draws, no 3-way markets
-    if not _is_two_way_market(books, home, away):
+    # 2-way moneyline only — reject all 3-way / draw markets
+    if not is_two_way_market(books, SOFT_BOOKS):
         return []
 
-    best    = best_per_side(books, home, away, SOFT_BOOKS)
-    bh, ba  = best[home], best[away]
+    best = best_per_side(books, home, away, SOFT_BOOKS)
+    bh, ba = best[home], best[away]
 
     if not bh["book"] or not ba["book"] or bh["book"] == ba["book"]:
         return []
@@ -228,28 +133,24 @@ def _scan_arb(game: dict, mins: float) -> list:
             "play":            f"Arb: {home} + {away}",
             "book":            f"{bh['book']} / {ba['book']}",
             "odds":            f"{bh['odds']} / {ba['odds']}",
-            "implied_prob":    arb["total_implied_pct"],
-            "true_prob":       100.0,
             "edge":            arb["arb_percentage"],
             "arb_percentage":  arb["arb_percentage"],
             "profit_per_1000": arb["profit_per_1000"],
             "legs":            arb["legs"],
             "fees_applied":    False,
-            "confidence":      0,
             "timing":          f"{mins:.0f} min to start",
-            "provisional":     False,
+            "confidence":      0,
         }]
     return []
 
 
 def _scan_polymarket(poly: list, sb_games: list) -> list:
-    # Build implied prob lookup from sportsbooks
     sb_implied: dict[str, float] = {}
     for g in sb_games:
-        books = {bm["key"]: bm for bm in g.get("bookmakers", [])} if "bookmakers" in g else g.get("books", {})
-        for entry in books.values():
-            mkts = entry.get("markets", []) if isinstance(entry, dict) else []
-            for mkt in mkts:
+        for entry in g.get("books", {}).values():
+            if not isinstance(entry, dict):
+                continue
+            for mkt in entry.get("markets", []):
                 if mkt.get("key") == "h2h":
                     for o in mkt.get("outcomes", []):
                         key = o["name"].lower().split()[-1]
@@ -265,82 +166,141 @@ def _scan_polymarket(poly: list, sb_games: list) -> list:
         div = abs(yes - matched) * 100
         if div < 4.0:
             continue
-        play = (
-            f"Buy YES ({yes:.2f}) — SB implies {matched:.1%}"
-            if yes < matched else
-            f"Buy NO ({1-yes:.2f}) — SB implies {1-matched:.1%}"
-        )
         opps.append({
-            "type":            "POSITIVE_EV",
-            "source":          "CROSS_MARKET",
-            "matchup":         m["question"][:80],
-            "play":            play,
-            "book":            "Polymarket",
-            "odds":            f"{yes:.3f} (decimal)",
-            "implied_prob":    round(yes * 100, 2),
-            "true_prob":       round(matched * 100, 2),
-            "edge":            round(div, 2),
-            "arb_percentage":  0.0,
-            "profit_per_1000": round(div * 10 * 0.98, 2),
-            "legs":            [],
-            "fees_applied":    True,
-            "confidence":      0,
-            "timing":          f"Closes: {m.get('end_date','N/A')}",
-            "provisional":     False,
+            "type":     "POSITIVE_EV",
+            "source":   "CROSS_MARKET",
+            "matchup":  m["question"][:80],
+            "play":     f"Buy {'YES' if yes < matched else 'NO'} on Polymarket",
+            "book":     "Polymarket",
+            "odds":     f"{yes:.3f}",
+            "implied_prob": round(yes * 100, 2),
+            "true_prob":    round(matched * 100, 2),
+            "edge":         round(div, 2),
+            "timing":   f"Closes: {m.get('end_date','N/A')}",
+            "confidence": 0,
         })
     return opps
 
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
+# ── Result resolution ──────────────────────────────────────────────────────────
 
-def _resolve_and_accumulate():
+def _local_validate(signal: dict) -> bool:
     """
-    Check for completed game results. For +EV signals, feed WIN/LOSS into the
-    daily recap buffer instead of posting individual result messages.
-    Arbitrage results are intentionally excluded from the recap.
+    Hard numeric gate applied before posting any signal.
+    Rejects signals with impossible or suspicious values.
+    Runs in addition to Claude's validation — catches data errors early.
     """
-    from core.db import get_active_sports_signals, resolve_sports_signal
-    from sports.results_tracker import (
-        fetch_completed_scores, _teams_match, _determine_result,
-    )
+    try:
+        edge = float(signal.get("edge", 0))
+    except (TypeError, ValueError):
+        log.info("Signal rejected (local validate) — edge not numeric")
+        return False
 
+    try:
+        # Timing field format: "240 min to start" or "N/A"
+        timing_raw = str(signal.get("timing", "0")).split()[0]
+        timing = int(float(timing_raw))
+    except (TypeError, ValueError, IndexError):
+        timing = -1   # treat unparseable timing as invalid
+
+    # Edge bounds: must be between 1% and 15%
+    if edge <= 0 or edge > 15:
+        log.info("Signal rejected (local validate) — edge %.2f%% out of range [1,15]", edge)
+        return False
+
+    # Timing: must be positive and under 1440 minutes (24 hours)
+    if timing <= 0 or timing > 1440:
+        log.info("Signal rejected (local validate) — timing %d min invalid", timing)
+        return False
+
+    return True
+    """Check active signals against completed scores. Feed wins into daily recap."""
     active = get_active_sports_signals()
     if not active:
         return
 
-    completed_games = fetch_completed_scores()
-    if not completed_games:
+    scores = fetch_sportsbook_scores()
+    if not scores:
         return
 
     for sig in active:
-        for game in completed_games:
-            if not _teams_match(sig.get("matchup", ""), game):
+        matchup = (sig.get("matchup") or "").lower()
+        for game in scores:
+            home = (game.get("home_team") or "").lower()
+            away = (game.get("away_team") or "").lower()
+            if home not in matchup and away not in matchup:
                 continue
 
-            result, note = _determine_result(sig, game)
+            # Determine result
+            game_scores = game.get("scores") or []
+            score_map   = {}
+            for s in game_scores:
+                try:
+                    score_map[(s.get("name") or "").lower()] = float(s["score"])
+                except (KeyError, TypeError, ValueError):
+                    pass
+
+            if len(score_map) < 2:
+                break
+
+            play      = (sig.get("play") or "").upper()
+            home_s    = score_map.get(home, 0)
+            away_s    = score_map.get(away, 0)
+            result    = "VOID"
+            note      = "Could not determine result"
+
+            # Moneyline resolution
+            bet_team  = None
+            if home in play.lower():
+                bet_team = home
+            elif away in play.lower():
+                bet_team = away
+
+            if bet_team:
+                bet_score = score_map.get(bet_team, 0)
+                opp_score = away_s if bet_team == home else home_s
+                if bet_score > opp_score:
+                    result = "WIN"
+                    note   = f"{bet_team.title()} won {bet_score:.0f}–{opp_score:.0f}"
+                elif bet_score < opp_score:
+                    result = "LOSS"
+                    note   = f"{bet_team.title()} lost {bet_score:.0f}–{opp_score:.0f}"
+                else:
+                    result = "PUSH"
+                    note   = f"Tied {bet_score:.0f}–{opp_score:.0f}"
+
             if result == "VOID":
                 break
 
             resolve_sports_signal(sig["id"], result, note)
-            log.info("Result resolved: %s — %s", sig.get("matchup"), result)
+            log.info("Result: %s — %s (%s)", sig.get("matchup"), result, note)
+            record_result(result)   # update daily win/loss counter
 
-            # Feed only +EV results into daily recap (not arbitrage)
-            sig_type = (sig.get("signal_type") or "").upper()
-            if sig_type != "ARBITRAGE":
-                _record_ev_result(
-                    play   = sig.get("play", sig.get("matchup", "")),
-                    result = result,
-                    edge   = float(sig.get("edge_pct", sig.get("edge", 0))),
-                )
+            # Only feed +EV (not arb) into daily recap
+            if (sig.get("signal_type") or "").upper() != "ARBITRAGE":
+                _ev_results.append({
+                    "play":   sig.get("play", ""),
+                    "result": result,
+                    "edge":   float(sig.get("edge_pct", sig.get("edge", 0))),
+                })
+                if result == "WIN":
+                    record_win(
+                        play = sig.get("play", ""),
+                        edge = float(sig.get("edge_pct", sig.get("edge", 0))),
+                    )
             break
 
-def run_odds_monitor():
-    log.info("Odds monitor started — base interval %ds", SPORTS_LOOP_SECONDS)
 
-    idle_cycles        = 0
-    cycle_count        = 0     # total cycles elapsed
-    CLAUDE_CALL_EVERY_N = 3    # call Claude at most once every N cycles
-    CLAUDE_MIN_EDGE     = 3.5  # minimum top-opportunity edge to justify a Claude call
+# ── Main loop ──────────────────────────────────────────────────────────────────
+
+def run_odds_monitor():
+    global _ev_results, _last_recap
+
+    log.info("Odds monitor started — base interval %ds, Claude every %d cycles",
+             SPORTS_LOOP_SECONDS, SPORTS_CLAUDE_EVERY_N_CYCLES)
+
+    cycle_count = 0
+    idle_cycles = 0
 
     while True:
         loop_start    = time.time()
@@ -350,86 +310,72 @@ def run_odds_monitor():
         try:
             sb_games   = fetch_sportsbook_odds()
             poly_mkts  = fetch_polymarket_sports()
-            _kalshi    = fetch_kalshi_sports()
-
             data_quality = "GOOD" if sb_games else "STALE"
 
             for game in sb_games:
-                mins = minutes_until(game["commence_time"])
-                # Always allow all games (no time restriction)
-                if mins is None:
+                if not _changed(game["game_id"], game["books"]):
                     continue
-
-                books = {bm["key"]: bm for bm in game.get("bookmakers", [])} \
-                    if "bookmakers" in game else game.get("books", {})
-                # Skip aggressively if odds are unchanged — no API value in reprocessing
-                if not _changed(game["game_id"], books):
-                    continue
-
-                opportunities.extend(_scan_ev(game, mins))
-                opportunities.extend(_scan_arb(game, mins))
+                opportunities.extend(_scan_ev(game))
+                opportunities.extend(_scan_arb(game))
 
             opportunities.extend(_scan_polymarket(poly_mkts, sb_games))
 
             if opportunities:
                 idle_cycles = 0
 
-                # ── Cooldown: skip Claude on non-qualifying cycles ────────────
-                if cycle_count % CLAUDE_CALL_EVERY_N != 0:
-                    log.debug("Claude cooldown — cycle %d (calls every %d cycles)",
-                              cycle_count, CLAUDE_CALL_EVERY_N)
+                # ── Claude cooldown gate ──────────────────────────────────────
+                if cycle_count % SPORTS_CLAUDE_EVERY_N_CYCLES != 0:
+                    log.debug("Claude cooldown (cycle %d)", cycle_count)
                 else:
-                    # ── Edge threshold: only call if best opp clears minimum ──
                     best_edge = max(
                         float(o.get("edge", o.get("arb_percentage", 0)))
                         for o in opportunities
                     )
-                    if best_edge < CLAUDE_MIN_EDGE:
-                        log.debug("Claude skipped — best edge %.2f%% below %.1f%% threshold",
-                                  best_edge, CLAUDE_MIN_EDGE)
+                    if best_edge < SPORTS_MIN_EDGE_TO_CALL:
+                        log.debug("Claude skipped — best edge %.2f%% below threshold", best_edge)
                     else:
-                        # ✅ SORT AND LIMIT INPUT — top 8 by edge only
-                        limited_opps = sorted(
+                        limited = sorted(
                             opportunities,
                             key=lambda o: float(o.get("edge", o.get("arb_percentage", 0))),
                             reverse=True,
-                        )[:8]
-                        log.info("Sending %d opportunities to Claude (best edge: %.2f%%)",
-                                 len(limited_opps), best_edge)
-                        result = call_betting_brain(limited_opps, data_quality)
+                        )[:MAX_OPPS_TO_CLAUDE]
+
+                        log.info("Sending %d opps to Claude (best edge: %.2f%%)",
+                                 len(limited), best_edge)
+                        result = call_betting_brain(limited, data_quality)
 
                         for signal in result.get("signals", []):
+                            # Hard numeric gate — reject impossible values first
+                            if not _local_validate(signal):
+                                continue
                             check = validate_signal(signal)
                             if not check.get("approved", True):
-                                log.info("Signal rejected: %s", check.get("reason"))
+                                log.info("Signal rejected (Claude): %s", check.get("reason"))
                                 continue
-                            signal["confidence"] = check.get("adjusted_confidence",
-                                                             signal.get("confidence", 5))
+                            signal["confidence"] = check.get(
+                                "adjusted_confidence", signal.get("confidence", 5)
+                            )
                             save_sports_signal(signal)
                             post_signal(signal, "sports")
-                            try:
-                                from content.publisher import whop_post_sports_signal
-                                whop_post_sports_signal(
-                                    matchup = signal.get("matchup", ""),
-                                    play    = signal.get("play", ""),
-                                    edge    = float(signal.get("edge", 0)),
-                                    book    = signal.get("book", ""),
-                                )
-                            except Exception:
-                                pass
             else:
                 idle_cycles += 1
-                log.debug("No opportunities this cycle (idle streak: %d)", idle_cycles)
+                log.debug("No opportunities (idle streak: %d)", idle_cycles)
 
-            # Resolve completed game results — feed EV results into daily recap buffer.
-            # Individual result posts are suppressed; recap posts once at end of day.
-            _resolve_and_accumulate()
+            # Resolve completed results
+            _resolve_results()
 
-            # Trigger daily recap once per day at 23:00 UTC
+            # Daily recap at 23:00 UTC
             now_utc = datetime.utcnow()
-            if (now_utc.hour == 23
-                    and (_last_recap_date is None or _last_recap_date < date.today())):
-                _post_daily_recap()
+            if now_utc.hour == 23 and (_last_recap is None or _last_recap < date.today()):
+                post_daily_recap(_ev_results)
+                _ev_results  = []
+                _last_recap  = date.today()
+
+            # Dynamic sleep: back off when idle
+            if idle_cycles >= 3:
+                sleep_interval = SPORTS_LOOP_SECONDS * 2
+            else:
+                sleep_interval = SPORTS_LOOP_SECONDS
 
         except Exception as e:
             log.error("odds_monitor error: %s", e)
@@ -437,14 +383,6 @@ def run_odds_monitor():
                 post_health_alert("odds_monitor", str(e))
             except Exception:
                 pass
-
-        # ── Dynamic throttle ──────────────────────────────────────────────────
-        # If idle long enough, back off to conserve API budget.
-        # Snaps back to base interval the moment an opportunity is found.
-        if idle_cycles >= IDLE_CYCLES_THRESHOLD:
-            sleep_interval = SPORTS_LOOP_SECONDS * IDLE_BACKOFF_MULTIPLIER
-        else:
-            sleep_interval = SPORTS_LOOP_SECONDS
 
         elapsed   = time.time() - loop_start
         sleep_for = max(0.0, sleep_interval - elapsed)
